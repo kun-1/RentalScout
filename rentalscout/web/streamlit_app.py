@@ -28,6 +28,10 @@ PRICE_AREA_CSV = ANALYSIS_DIR / "price_area_analysis.csv"
 LOCATION_VALUE_CSV = ANALYSIS_DIR / "location_value_analysis.csv"
 GEO_CLUSTER_CSV = ANALYSIS_DIR / "geo_clusters.csv"
 WORKPLACE_MARKER_TITLE = "工作中心: 上海本冠医疗美容门诊部"
+AMAP_TILE_URL = (
+    "https://webrd04.is.autonavi.com/appmaptile?"
+    "lang=zh_cn&size=1&scale=1&style=7&x={x}&y={y}&z={z}"
+)
 
 BOOLEAN_COLUMNS = {
     "has_price",
@@ -513,6 +517,7 @@ def render_map_tab(frame: pd.DataFrame, distance: pd.DataFrame) -> None:
         pdk.Deck(
             initial_view_state=_map_view_state(map_frame),
             layers=[
+                chinese_base_map_layer(),
                 pdk.Layer(
                     "ScatterplotLayer",
                     data=map_frame,
@@ -549,6 +554,27 @@ def render_map_tab(frame: pd.DataFrame, distance: pd.DataFrame) -> None:
             map_style=None,
         ),
         height=720,
+    )
+
+
+def chinese_base_map_layer() -> pdk.Layer:
+    """高德中文瓦片底图。"""
+
+    return pdk.Layer(
+        "TileLayer",
+        data=AMAP_TILE_URL,
+        min_zoom=0,
+        max_zoom=19,
+        tile_size=256,
+        render_sub_layers={
+            "@@type": "BitmapLayer",
+            "data": None,
+            "image": "@@=props.data",
+            "bounds": (
+                "@@=[props.tile.bbox.west, props.tile.bbox.south, "
+                "props.tile.bbox.east, props.tile.bbox.north]"
+            ),
+        },
     )
 
 
