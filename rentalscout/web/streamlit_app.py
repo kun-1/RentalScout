@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 
 import pandas as pd
@@ -76,6 +77,8 @@ BUCKET_LABELS = {
     "8_to_12km": "8-12km",
     "over_12km": "12km 以外",
 }
+BUCKET_ORDER = ["within_4km", "4_to_8km", "8_to_12km", "over_12km"]
+TIER_ORDER = ["ready", "caution", "blocked"]
 
 
 def main() -> None:
@@ -146,6 +149,79 @@ def missing_inputs(data: dict[str, pd.DataFrame]) -> list[Path]:
     return [path for key, path in paths.items() if data[key].empty]
 
 
+def _bounded_range_inputs(
+    label: str,
+    *,
+    min_allowed: int,
+    max_allowed: int,
+    default_min: int,
+    default_max: int,
+    step: int,
+    suffix: str,
+) -> tuple[int, int]:
+    """渲染带上下限保护的范围输入。"""
+
+    st.sidebar.caption(f"{label} ({min_allowed}-{max_allowed} {suffix})")
+    left, right = st.sidebar.columns(2)
+    lower = left.number_input(
+        "最小值",
+        min_value=min_allowed,
+        max_value=max_allowed,
+        value=max(min_allowed, min(default_min, max_allowed)),
+        step=step,
+        key=f"{label}_min",
+        label_visibility="collapsed",
+    )
+    upper = right.number_input(
+        "最大值",
+        min_value=min_allowed,
+        max_value=max_allowed,
+        value=max(min_allowed, min(default_max, max_allowed)),
+        step=step,
+        key=f"{label}_max",
+        label_visibility="collapsed",
+    )
+    low = int(min(lower, upper))
+    high = int(max(lower, upper))
+    return low, high
+
+
+def _sidebar_multi_pills(
+    label: str,
+    *,
+    options: list[str],
+    default: list[str],
+    format_func: object,
+) -> list[str]:
+    """优先使用 pill 风格多选, 兼容旧版 Streamlit。"""
+
+    pills = getattr(st.sidebar, "pills", None)
+    if pills is None:
+        return st.sidebar.multiselect(
+            label,
+            options=options,
+            default=default,
+            format_func=format_func,
+        )
+    selected = pills(
+        label,
+        options=options,
+        default=default,
+        format_func=format_func,
+        selection_mode="multi",
+    )
+    return list(selected)
+
+
+def _tier_label(value: str) -> str:
+    labels = {
+        "ready": "Ready",
+        "caution": "Caution",
+        "blocked": "Blocked",
+    }
+    return labels.get(value, value)
+
+
 def render_sidebar(data: dict[str, pd.DataFrame]) -> dict[str, object]:
     """渲染全局筛选器。"""
 
@@ -155,49 +231,81 @@ def render_sidebar(data: dict[str, pd.DataFrame]) -> dict[str, object]:
     distance = data["distance"]
     geo_cluster = data["geo_cluster"]
 
-    max_price = int(_max_or_default(quality, "rent_price", 6000))
-    price_range = st.sidebar.slider("租金", 0, max(max_price, 6000), (3500, min(6000, max_price)))
-    max_area = int(_max_or_default(quality, "area_sqm", 120))
-    area_range = st.sidebar.slider("面积", 0, max(max_area, 120), (10, min(max_area, 120)))
-
-    bucket_options = sorted(
-        value for value in distance.get("distance_bucket", pd.Series(dtype=str)).dropna().unique()
+    st.sidebar.subheader("数值范围")
+    max_price = max(int(_max_or_default(quality, "rent_price", 6000)), 6000)
+    max_area = max(int(_max_or_default(quality, "area_sqm", 120)), 120)
+    max_rent_per_sqm = max(int(_max_or_default(price_area, "rent_per_sqm", 300)), 300)
+    price_range = _bounded_range_inputs(
+        "租金",
+        min_allowed=0,
+        max_allowed=max_price,
+        default_min=3500,
+        default_max=min(6000, max_price),
+        step=100,
+        suffix="元/月",
     )
-    selected_buckets = st.sidebar.multiselect(
+    area_range = _bounded_range_inputs(
+        "面积",
+        min_allowed=0,
+        max_allowed=max_area,
+        default_min=10,
+        default_max=min(120, max_area),
+        step=5,
+        suffix="平米",
+    )
+    rent_per_sqm_range = _bounded_range_inputs(
+        "单位面积租金",
+        min_allowed=0,
+        max_allowed=max_rent_per_sqm,
+        default_min=0,
+        default_max=min(300, max_rent_per_sqm),
+        step=5,
+        suffix="元/平米/月",
+    )
+
+    st.sidebar.subheader("分类筛选")
+    available_buckets = set(
+        distance.get("distance_bucket", pd.Series(dtype=str)).dropna().unique()
+    )
+    bucket_options = [value for value in BUCKET_ORDER if value in available_buckets]
+    selected_buckets = _sidebar_multi_pills(
         "距离分桶",
         options=bucket_options,
         default=bucket_options,
         format_func=lambda value: BUCKET_LABELS.get(value, value),
     )
 
-    tier_options = sorted(
-        value for value in quality.get("analysis_tier", pd.Series(dtype=str)).dropna().unique()
+    available_tiers = set(
+        quality.get("analysis_tier", pd.Series(dtype=str)).dropna().unique()
     )
-    selected_tiers = st.sidebar.multiselect("质量层级", tier_options, default=tier_options)
+    tier_options = [value for value in TIER_ORDER if value in available_tiers]
+    selected_tiers = _sidebar_multi_pills(
+        "质量层级",
+        options=tier_options,
+        default=tier_options,
+        format_func=_tier_label,
+    )
 
     cluster_options = sorted(
         value
         for value in geo_cluster.get("geo_cluster_id", pd.Series(dtype=str)).dropna().unique()
         if value != "noise"
     )
-    selected_clusters = st.sidebar.multiselect("空间簇", cluster_options, default=[])
+    cluster_labels = cluster_label_map(geo_cluster, quality)
+    selected_clusters = st.sidebar.multiselect(
+        "空间簇",
+        cluster_options,
+        default=[],
+        format_func=lambda value: cluster_labels.get(value, value),
+        placeholder="选择空间区域",
+    )
 
     st.sidebar.divider()
+    st.sidebar.subheader("偏好")
     exclude_apartment = st.sidebar.checkbox("排除疑似公寓", value=False)
     exclude_duplicates = st.sidebar.checkbox("排除重复候选", value=False)
     only_good_value = st.sidebar.checkbox("只看附近低单价", value=False)
     only_good_price = st.sidebar.checkbox("只看同距离低租金", value=False)
-
-    if not price_area.empty:
-        rent_per_sqm_max = int(_max_or_default(price_area, "rent_per_sqm", 300))
-        rent_per_sqm_range = st.sidebar.slider(
-            "单位面积租金",
-            0,
-            max(rent_per_sqm_max, 300),
-            (0, min(rent_per_sqm_max, 300)),
-        )
-    else:
-        rent_per_sqm_range = (0, 300)
 
     return {
         "price_range": price_range,
@@ -211,6 +319,44 @@ def render_sidebar(data: dict[str, pd.DataFrame]) -> dict[str, object]:
         "only_good_value": only_good_value,
         "only_good_price": only_good_price,
     }
+
+
+def cluster_label_map(geo_cluster: pd.DataFrame, quality: pd.DataFrame) -> dict[str, str]:
+    """为空间簇生成面向人的区域名称。"""
+
+    if geo_cluster.empty or quality.empty:
+        return {}
+    quality_names = quality.rename(columns={"source_listing_id": "listing_id"})
+    columns = [
+        column
+        for column in ["listing_id", "subdistrict", "community_name", "title"]
+        if column in quality_names.columns
+    ]
+    if "listing_id" not in columns:
+        return {}
+    merged = geo_cluster.merge(quality_names[columns], how="left", on="listing_id")
+    labels: dict[str, str] = {}
+    for cluster_id, group in merged.groupby("geo_cluster_id"):
+        if not isinstance(cluster_id, str) or cluster_id == "noise":
+            continue
+        size = int(group["listing_id"].count())
+        area_name = _best_cluster_area_name(group)
+        labels[cluster_id] = f"{area_name}区域 ({size}套, {cluster_id})"
+    return labels
+
+
+def _best_cluster_area_name(group: pd.DataFrame) -> str:
+    for column in ["subdistrict", "community_name", "title"]:
+        if column not in group.columns:
+            continue
+        names = [
+            str(value).strip()
+            for value in group[column].dropna()
+            if str(value).strip() and str(value).strip().lower() != "nan"
+        ]
+        if names:
+            return Counter(names).most_common(1)[0][0]
+    return "未命名"
 
 
 def merged_listing_frame(data: dict[str, pd.DataFrame]) -> pd.DataFrame:
