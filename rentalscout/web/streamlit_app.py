@@ -103,7 +103,7 @@ def main() -> None:
     render_overview(data, filtered)
     tabs = st.tabs(["地图", "质量", "距离", "价格面积", "位置价值", "经纬度聚类", "房源表"])
     with tabs[0]:
-        render_map_tab(filtered, data["distance"])
+        render_map_tab(filtered, data["distance"], filters)
     with tabs[1]:
         render_quality_tab(data["quality"], filtered)
     with tabs[2]:
@@ -306,6 +306,7 @@ def render_sidebar(data: dict[str, pd.DataFrame]) -> dict[str, object]:
 
     st.sidebar.divider()
     st.sidebar.subheader("偏好")
+    value_weights = render_value_weight_controls()
     exclude_apartment = st.sidebar.checkbox("排除疑似公寓", value=False)
     exclude_duplicates = st.sidebar.checkbox("排除重复候选", value=False)
     only_good_value = st.sidebar.checkbox("只看附近低单价", value=False)
@@ -322,6 +323,29 @@ def render_sidebar(data: dict[str, pd.DataFrame]) -> dict[str, object]:
         "exclude_duplicates": exclude_duplicates,
         "only_good_value": only_good_value,
         "only_good_price": only_good_price,
+        "value_weights": value_weights,
+    }
+
+
+def render_value_weight_controls() -> dict[str, int]:
+    """渲染动态性价比权重控制。"""
+
+    with st.sidebar.expander("性价比权重", expanded=False):
+        area_weight = st.slider("面积", 0, 100, 45, step=5)
+        distance_weight = st.slider("距离", 0, 100, 35, step=5)
+        money_weight = st.slider("金钱", 0, 100, 20, step=5)
+        total = area_weight + distance_weight + money_weight
+        if total == 0:
+            st.caption("三个权重不能同时为 0, 当前会按等权计算。")
+        else:
+            st.caption(
+                f"当前比例: 面积 {area_weight / total:.0%}, "
+                f"距离 {distance_weight / total:.0%}, 金钱 {money_weight / total:.0%}"
+            )
+    return {
+        "area": area_weight,
+        "distance": distance_weight,
+        "money": money_weight,
     }
 
 
@@ -494,10 +518,15 @@ def render_overview(data: dict[str, pd.DataFrame], filtered: pd.DataFrame) -> No
     )
 
 
-def render_map_tab(frame: pd.DataFrame, distance: pd.DataFrame) -> None:
+def render_map_tab(
+    frame: pd.DataFrame,
+    distance: pd.DataFrame,
+    filters: dict[str, object],
+) -> None:
     st.subheader("地图视图")
     map_frame = frame.dropna(subset=["latitude", "longitude"]).copy()
     map_frame["marker_type"] = "listing"
+    map_frame = add_value_scores(map_frame, filters["value_weights"])
     workplace = workplace_marker(distance)
     if workplace:
         map_frame = pd.concat([map_frame, pd.DataFrame([workplace])], ignore_index=True)
@@ -506,36 +535,44 @@ def render_map_tab(frame: pd.DataFrame, distance: pd.DataFrame) -> None:
         return
     map_frame["radius"] = map_frame["marker_type"].map({"workplace": 260}).fillna(70)
     map_frame["fill_color"] = map_frame.apply(_map_color, axis=1)
+    map_frame["shape"] = map_frame.apply(_map_shape, axis=1)
+    map_frame["shape_size"] = map_frame["marker_type"].map({"workplace": 34}).fillna(24)
     map_frame["rent_text"] = map_frame["rent_price"].map(_money_text)
     map_frame["area_text"] = map_frame["area_sqm"].map(_area_text)
     map_frame["rent_per_sqm_text"] = map_frame["rent_per_sqm"].map(_rent_per_sqm_text)
     map_frame["distance_text"] = map_frame["straight_distance_meters"].map(_distance_text)
     map_frame["cluster_text"] = map_frame["geo_cluster_id"].fillna("")
+    map_frame["quality_text"] = map_frame["analysis_tier"].fillna("")
+    map_frame["value_score_text"] = map_frame["value_score"].map(_score_text)
+    map_frame["value_level_text"] = map_frame["value_level"].fillna("")
     map_frame["url_text"] = map_frame["source_url"].fillna("")
-    st.caption("红色大点为工作中心; 绿色为附近低单价房源, 红色小点为附近高单价房源。")
+    st.caption(
+        "颜色表示综合性价比: 绿=高, 蓝=中性, 红=低。"
+        "形状表示质量层级: ● ready, △ caution, □ blocked, ★ 工作中心。"
+    )
     st.pydeck_chart(
         pdk.Deck(
             initial_view_state=_map_view_state(map_frame),
             layers=[
                 chinese_base_map_layer(),
                 pdk.Layer(
-                    "ScatterplotLayer",
+                    "TextLayer",
                     data=map_frame,
                     get_position="[longitude, latitude]",
-                    get_radius="radius",
-                    get_fill_color="fill_color",
-                    get_line_color=[255, 255, 255, 220],
-                    line_width_min_pixels=1,
+                    get_text="shape",
+                    get_color="fill_color",
+                    get_size="shape_size",
+                    get_alignment_baseline="'center'",
+                    get_text_anchor="'middle'",
                     pickable=True,
-                    opacity=0.86,
-                    stroked=True,
-                    filled=True,
                 )
             ],
             tooltip={
                 "html": (
                     "<div style='max-width:280px'>"
                     "<b>{title}</b><br/>"
+                    "性价比: {value_level_text} {value_score_text}<br/>"
+                    "质量层级: {quality_text}<br/>"
                     "租金: {rent_text}<br/>"
                     "面积: {area_text}<br/>"
                     "单价: {rent_per_sqm_text}<br/>"
@@ -575,6 +612,57 @@ def chinese_base_map_layer() -> pdk.Layer:
                 "props.tile.bbox.east, props.tile.bbox.north]"
             ),
         },
+    )
+
+
+def add_value_scores(frame: pd.DataFrame, weights: object) -> pd.DataFrame:
+    """按面积、距离、金钱权重动态计算综合性价比。"""
+
+    if frame.empty:
+        return frame
+    scored = frame.copy()
+    weight_map = weights if isinstance(weights, dict) else {}
+    area_weight = float(weight_map.get("area", 45))
+    distance_weight = float(weight_map.get("distance", 35))
+    money_weight = float(weight_map.get("money", 20))
+    total_weight = area_weight + distance_weight + money_weight
+    if total_weight <= 0:
+        area_weight = distance_weight = money_weight = 1
+        total_weight = 3
+
+    area_score = _normalize_high_good(scored.get("area_sqm"))
+    distance_score = _normalize_low_good(scored.get("straight_distance_meters"))
+    money_score = _normalize_low_good(scored.get("rent_price"))
+    scored["value_score"] = (
+        area_score * area_weight
+        + distance_score * distance_weight
+        + money_score * money_weight
+    ) / total_weight
+    scored["value_score"] = (scored["value_score"] * 100).round(1)
+    scored["value_level"] = value_levels(scored["value_score"])
+    return scored
+
+
+def value_levels(scores: pd.Series) -> pd.Series:
+    """把综合性价比分成低、中、高三档。"""
+
+    if scores.empty:
+        return pd.Series(dtype=str)
+    valid = scores.dropna()
+    if valid.empty:
+        return pd.Series(["中性"] * len(scores), index=scores.index)
+    low_threshold = valid.quantile(0.3)
+    high_threshold = valid.quantile(0.7)
+    if low_threshold == high_threshold:
+        return pd.Series(["中性"] * len(scores), index=scores.index)
+    return scores.map(
+        lambda score: (
+            "高性价比"
+            if score >= high_threshold
+            else "低性价比"
+            if score <= low_threshold
+            else "中性"
+        )
     )
 
 
@@ -819,16 +907,48 @@ def _count_value(frame: pd.DataFrame, column: str, value: object) -> int:
     return int((frame[column] == value).sum())
 
 
+def _normalize_high_good(values: pd.Series | None) -> pd.Series:
+    if values is None:
+        return pd.Series(dtype=float)
+    numeric = pd.to_numeric(values, errors="coerce")
+    minimum = numeric.min()
+    maximum = numeric.max()
+    if pd.isna(minimum) or pd.isna(maximum) or minimum == maximum:
+        return pd.Series([0.5] * len(numeric), index=numeric.index)
+    return ((numeric - minimum) / (maximum - minimum)).fillna(0.5)
+
+
+def _normalize_low_good(values: pd.Series | None) -> pd.Series:
+    if values is None:
+        return pd.Series(dtype=float)
+    return 1 - _normalize_high_good(values)
+
+
 def _map_color(row: pd.Series) -> list[int]:
     if row.get("marker_type") == "workplace":
         return [239, 68, 68, 245]
-    if bool(row.get("nearby_good_value", False)):
+    if row.get("value_level") == "高性价比":
         return [22, 163, 74, 220]
-    if bool(row.get("nearby_expensive", False)):
+    if row.get("value_level") == "低性价比":
         return [220, 38, 38, 220]
-    if bool(row.get("is_geo_noise", False)):
-        return [107, 114, 128, 200]
     return [37, 99, 235, 210]
+
+
+def _map_shape(row: pd.Series) -> str:
+    if row.get("marker_type") == "workplace":
+        return "★"
+    tier = row.get("analysis_tier")
+    if tier == "caution":
+        return "△"
+    if tier == "blocked":
+        return "□"
+    return "●"
+
+
+def _score_text(value: object) -> str:
+    if pd.isna(value):
+        return "-"
+    return f"{float(value):.1f}"
 
 
 def _map_view_state(frame: pd.DataFrame) -> pdk.ViewState:
