@@ -550,13 +550,14 @@ def render_map_tab(
         "颜色表示综合性价比: 绿=高, 蓝=中性, 红=低。"
         "形状表示质量层级: ● ready, △ caution, □ blocked, ★ 工作中心。"
     )
-    st.pydeck_chart(
+    event = st.pydeck_chart(
         pdk.Deck(
             initial_view_state=_map_view_state(map_frame),
             layers=[
                 chinese_base_map_layer(),
                 pdk.Layer(
                     "TextLayer",
+                    id="rental-listing-points",
                     data=map_frame,
                     get_position="[longitude, latitude]",
                     get_text="shape",
@@ -591,7 +592,11 @@ def render_map_tab(
             map_style=None,
         ),
         height=720,
+        on_select="rerun",
+        selection_mode="single-object",
+        key="rental_map",
     )
+    render_selected_listing_card(event)
 
 
 def chinese_base_map_layer() -> pdk.Layer:
@@ -613,6 +618,56 @@ def chinese_base_map_layer() -> pdk.Layer:
             ),
         },
     )
+
+
+def render_selected_listing_card(event: object) -> None:
+    """渲染地图点击选中的房源卡片。"""
+
+    selected = selected_map_object(event)
+    if not selected:
+        st.caption("悬停可查看房源信息; 点击房源点后可在这里打开原站链接。")
+        return
+    if selected.get("marker_type") == "workplace":
+        st.info("已选中工作中心。")
+        return
+
+    title = str(selected.get("title") or "未命名房源")
+    source_url = str(selected.get("source_url") or "")
+    with st.container(border=True):
+        st.markdown(f"**{title}**")
+        columns = st.columns(5)
+        columns[0].metric("租金", str(selected.get("rent_text") or "-"))
+        columns[1].metric("面积", str(selected.get("area_text") or "-"))
+        columns[2].metric("单价", str(selected.get("rent_per_sqm_text") or "-"))
+        columns[3].metric("距离", str(selected.get("distance_text") or "-"))
+        columns[4].metric("质量", str(selected.get("quality_text") or "-"))
+        st.caption(
+            f"性价比: {selected.get('value_level_text') or '-'} "
+            f"{selected.get('value_score_text') or '-'} | "
+            f"空间簇: {selected.get('cluster_text') or '-'}"
+        )
+        if source_url.startswith("http"):
+            st.link_button("打开原站链接", source_url)
+        else:
+            st.warning("这个点没有可打开的原站链接。")
+
+
+def selected_map_object(event: object) -> dict[str, object] | None:
+    """从 Streamlit pydeck 选择事件中取出选中对象。"""
+
+    if not isinstance(event, dict):
+        return None
+    selection = event.get("selection")
+    if not isinstance(selection, dict):
+        return None
+    objects = selection.get("objects")
+    if not isinstance(objects, dict):
+        return None
+    layer_objects = objects.get("rental-listing-points")
+    if not isinstance(layer_objects, list) or not layer_objects:
+        return None
+    selected = layer_objects[0]
+    return selected if isinstance(selected, dict) else None
 
 
 def add_value_scores(frame: pd.DataFrame, weights: object) -> pd.DataFrame:
