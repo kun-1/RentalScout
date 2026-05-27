@@ -33,6 +33,9 @@ APARTMENT_PATTERN = re.compile(r"(公寓|自如|魔方|泊寓|冠寓|人才公�
 LOW_CONFIDENCE_SUBDISTRICT_PATTERN = re.compile(
     r"(地铁站|附近|^[一二三四五六七八九十\d]+号线|(?<!街)道$|路$|街$|线)"
 )
+SHANGHAI_LOCATION_HINT_PATTERN = re.compile(
+    r"(上海|浦东|世纪大道|商城路|八佰伴|朱家滩|陆家嘴|张江|金桥|塘桥|花木|北蔡|周浦)"
+)
 
 
 class AnalysisTier(StrEnum):
@@ -173,6 +176,7 @@ def _quality_row(
     can_analyze_duplicates = bool(listing.source_listing_id and listing.community_name)
 
     notes = _quality_notes(
+        listing=listing,
         price_in_range=price_in_range,
         has_area=listing.area_sqm is not None,
         area_outlier=area_outlier,
@@ -308,6 +312,7 @@ def _analysis_tier(
 
 def _quality_notes(
     *,
+    listing: NormalizedRentalListing,
     price_in_range: bool,
     has_area: bool,
     area_outlier: bool,
@@ -326,7 +331,10 @@ def _quality_notes(
     elif area_outlier:
         notes.append("面积或单位面积租金异常, 不能做单位面积租金")
     if coordinate_suspicious:
-        notes.append("经纬度不在上海合理范围")
+        if _has_shanghai_location_hint(listing):
+            notes.append("经纬度不在上海合理范围, 但正文含上海地址线索, 需要二次定位")
+        else:
+            notes.append("经纬度不在上海合理范围")
     elif not can_analyze_map:
         notes.append("缺少浦东坐标条件, 不能进入地图和通勤分析")
     if subdistrict_low_confidence:
@@ -338,6 +346,21 @@ def _quality_notes(
     if missing_published_at:
         notes.append("发布时间缺失, 不能做新鲜度分析")
     return notes
+
+
+def _has_shanghai_location_hint(listing: NormalizedRentalListing) -> bool:
+    text = " ".join(
+        value
+        for value in [
+            listing.title,
+            listing.address_text,
+            listing.community_name,
+            listing.subdistrict,
+            listing.description,
+        ]
+        if value
+    )
+    return bool(SHANGHAI_LOCATION_HINT_PATTERN.search(text))
 
 
 def _write_quality_csv(rows: list[WellceeQualityRow], path: Path) -> None:

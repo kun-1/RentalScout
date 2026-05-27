@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 from pathlib import Path
 
 import pandas as pd
-import pydeck as pdk
 import streamlit as st
+import streamlit.components.v1 as components
 
 from rentalscout.analysis.geo_clusters import (
     DEFAULT_CLUSTER_EPS_METERS,
@@ -29,8 +30,8 @@ LOCATION_VALUE_CSV = ANALYSIS_DIR / "location_value_analysis.csv"
 GEO_CLUSTER_CSV = ANALYSIS_DIR / "geo_clusters.csv"
 WORKPLACE_MARKER_TITLE = "工作中心: 上海本冠医疗美容门诊部"
 AMAP_TILE_URL = (
-    "https://webrd04.is.autonavi.com/appmaptile?"
-    "lang=zh_cn&size=1&scale=1&style=7&x={x}&y={y}&z={z}"
+    "https://webst04.is.autonavi.com/appmaptile?"
+    "x={x}&y={y}&z={z}&lang=zh_cn&size=1&scl=1&style=7"
 )
 
 BOOLEAN_COLUMNS = {
@@ -317,6 +318,7 @@ def render_sidebar(data: dict[str, pd.DataFrame]) -> dict[str, object]:
         "area_range": area_range,
         "rent_per_sqm_range": rent_per_sqm_range,
         "distance_buckets": selected_buckets,
+        "distance_filter_active": set(selected_buckets) != set(bucket_options),
         "analysis_tiers": selected_tiers,
         "geo_clusters": selected_clusters,
         "exclude_apartment": exclude_apartment,
@@ -486,7 +488,11 @@ def apply_listing_filters(frame: pd.DataFrame, filters: dict[str, object]) -> pd
                 inclusive="both",
             )
         ]
-    if filters["distance_buckets"] and "distance_bucket" in filtered.columns:
+    if (
+        filters.get("distance_filter_active")
+        and filters["distance_buckets"]
+        and "distance_bucket" in filtered.columns
+    ):
         filtered = filtered[filtered["distance_bucket"].isin(filters["distance_buckets"])]
     if filters["analysis_tiers"] and "analysis_tier" in filtered.columns:
         filtered = filtered[filtered["analysis_tier"].isin(filters["analysis_tiers"])]
@@ -524,7 +530,14 @@ def render_map_tab(
     filters: dict[str, object],
 ) -> None:
     st.subheader("地图视图")
-    map_frame = frame.dropna(subset=["latitude", "longitude"]).copy()
+    missing_coordinate = frame[["latitude", "longitude"]].isna().any(axis=1)
+    suspicious_coordinate = (
+        frame["coordinate_suspicious"].fillna(False)
+        if "coordinate_suspicious" in frame.columns
+        else pd.Series(False, index=frame.index)
+    )
+    hidden_coordinate_count = int((missing_coordinate | suspicious_coordinate).sum())
+    map_frame = frame[~missing_coordinate & ~suspicious_coordinate].copy()
     map_frame["marker_type"] = "listing"
     map_frame = add_value_scores(map_frame, filters["value_weights"])
     workplace = workplace_marker(distance)
@@ -532,11 +545,12 @@ def render_map_tab(
         map_frame = pd.concat([map_frame, pd.DataFrame([workplace])], ignore_index=True)
     if map_frame.empty:
         st.info("没有可用于地图展示的坐标。")
+        if hidden_coordinate_count:
+            st.warning(f"{hidden_coordinate_count} 条房源无可用上海坐标, 已从地图中隐藏。")
         return
-    map_frame["radius"] = map_frame["marker_type"].map({"workplace": 260}).fillna(70)
+    map_frame = ensure_map_value_columns(map_frame)
+    map_frame["radius"] = map_frame["marker_type"].map({"workplace": 180}).fillna(85)
     map_frame["fill_color"] = map_frame.apply(_map_color, axis=1)
-    map_frame["shape"] = map_frame.apply(_map_shape, axis=1)
-    map_frame["shape_size"] = map_frame["marker_type"].map({"workplace": 34}).fillna(24)
     map_frame["rent_text"] = map_frame["rent_price"].map(_money_text)
     map_frame["area_text"] = map_frame["area_sqm"].map(_area_text)
     map_frame["rent_per_sqm_text"] = map_frame["rent_per_sqm"].map(_rent_per_sqm_text)
@@ -548,126 +562,295 @@ def render_map_tab(
     map_frame["url_text"] = map_frame["source_url"].fillna("")
     st.caption(
         "颜色表示综合性价比: 绿=高, 蓝=中性, 红=低。"
-        "形状表示质量层级: ● ready, △ caution, □ blocked, ★ 工作中心。"
+        "形状表示质量层级: 圆=ready, 三角=caution, 方形=blocked, 大圆=工作中心。"
     )
-    event = st.pydeck_chart(
-        pdk.Deck(
-            initial_view_state=_map_view_state(map_frame),
-            layers=[
-                chinese_base_map_layer(),
-                pdk.Layer(
-                    "TextLayer",
-                    id="rental-listing-points",
-                    data=map_frame,
-                    get_position="[longitude, latitude]",
-                    get_text="shape",
-                    get_color="fill_color",
-                    get_size="shape_size",
-                    get_alignment_baseline="'center'",
-                    get_text_anchor="'middle'",
-                    pickable=True,
-                )
-            ],
-            tooltip={
-                "html": (
-                    "<div style='max-width:280px'>"
-                    "<b>{title}</b><br/>"
-                    "性价比: {value_level_text} {value_score_text}<br/>"
-                    "质量层级: {quality_text}<br/>"
-                    "租金: {rent_text}<br/>"
-                    "面积: {area_text}<br/>"
-                    "单价: {rent_per_sqm_text}<br/>"
-                    "距离: {distance_text}<br/>"
-                    "空间簇: {cluster_text}<br/>"
-                    "<span style='font-size:11px'>{url_text}</span>"
-                    "</div>"
-                ),
-                "style": {
-                    "backgroundColor": "rgba(17, 24, 39, 0.92)",
-                    "color": "white",
-                    "fontSize": "13px",
-                    "lineHeight": "1.45",
-                },
-            },
-            map_style=None,
-        ),
-        height=720,
-        on_select="rerun",
-        selection_mode="single-object",
-        key="rental_map",
-    )
-    render_selected_listing_card(event)
-
-
-def chinese_base_map_layer() -> pdk.Layer:
-    """高德中文瓦片底图。"""
-
-    return pdk.Layer(
-        "TileLayer",
-        data=AMAP_TILE_URL,
-        min_zoom=0,
-        max_zoom=19,
-        tile_size=256,
-        render_sub_layers={
-            "@@type": "BitmapLayer",
-            "data": None,
-            "image": "@@=props.data",
-            "bounds": (
-                "@@=[props.tile.bbox.west, props.tile.bbox.south, "
-                "props.tile.bbox.east, props.tile.bbox.north]"
-            ),
-        },
+    if hidden_coordinate_count:
+        st.warning(f"{hidden_coordinate_count} 条房源无可用上海坐标, 已从地图中隐藏。")
+    components.html(
+        build_leaflet_map_html(map_frame),
+        height=740,
+        scrolling=False,
     )
 
 
-def render_selected_listing_card(event: object) -> None:
-    """渲染地图点击选中的房源卡片。"""
+def ensure_map_value_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """补齐地图 hover/tooltip 所需的动态评分字段。"""
 
-    selected = selected_map_object(event)
-    if not selected:
-        st.caption("悬停可查看房源信息; 点击房源点后可在这里打开原站链接。")
-        return
-    if selected.get("marker_type") == "workplace":
-        st.info("已选中工作中心。")
-        return
-
-    title = str(selected.get("title") or "未命名房源")
-    source_url = str(selected.get("source_url") or "")
-    with st.container(border=True):
-        st.markdown(f"**{title}**")
-        columns = st.columns(5)
-        columns[0].metric("租金", str(selected.get("rent_text") or "-"))
-        columns[1].metric("面积", str(selected.get("area_text") or "-"))
-        columns[2].metric("单价", str(selected.get("rent_per_sqm_text") or "-"))
-        columns[3].metric("距离", str(selected.get("distance_text") or "-"))
-        columns[4].metric("质量", str(selected.get("quality_text") or "-"))
-        st.caption(
-            f"性价比: {selected.get('value_level_text') or '-'} "
-            f"{selected.get('value_score_text') or '-'} | "
-            f"空间簇: {selected.get('cluster_text') or '-'}"
-        )
-        if source_url.startswith("http"):
-            st.link_button("打开原站链接", source_url)
-        else:
-            st.warning("这个点没有可打开的原站链接。")
+    ensured = frame.copy()
+    if "value_score" not in ensured.columns:
+        ensured["value_score"] = None
+    if "value_level" not in ensured.columns:
+        ensured["value_level"] = ""
+    if "value_score_text" not in ensured.columns:
+        ensured["value_score_text"] = ensured["value_score"].map(_score_text)
+    if "value_level_text" not in ensured.columns:
+        ensured["value_level_text"] = ensured["value_level"].fillna("")
+    return ensured
 
 
-def selected_map_object(event: object) -> dict[str, object] | None:
-    """从 Streamlit pydeck 选择事件中取出选中对象。"""
+def build_leaflet_map_html(frame: pd.DataFrame) -> str:
+    """生成中文底图 + 自定义点形状的 Leaflet 地图。"""
 
-    if not isinstance(event, dict):
-        return None
-    selection = event.get("selection")
-    if not isinstance(selection, dict):
-        return None
-    objects = selection.get("objects")
-    if not isinstance(objects, dict):
-        return None
-    layer_objects = objects.get("rental-listing-points")
-    if not isinstance(layer_objects, list) or not layer_objects:
-        return None
-    selected = layer_objects[0]
-    return selected if isinstance(selected, dict) else None
+    points = [_leaflet_point(row) for _, row in frame.iterrows()]
+    payload = json.dumps(points, ensure_ascii=False, allow_nan=False)
+    return f"""
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css"
+  />
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css"
+  />
+  <style>
+    html, body, #map {{
+      height: 720px;
+      margin: 0;
+      width: 100%;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    .leaflet-container {{
+      background: #eef2f3;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+    }}
+    .rs-marker {{
+      align-items: center;
+      display: flex;
+      justify-content: center;
+    }}
+    .rs-shape {{
+      box-shadow: 0 2px 8px rgba(15, 23, 42, 0.26);
+      display: block;
+    }}
+    .rs-ready {{
+      border: 2px solid #ffffff;
+      border-radius: 999px;
+      height: 18px;
+      width: 18px;
+    }}
+    .rs-caution {{
+      height: 0;
+      width: 0;
+      border-left: 12px solid transparent;
+      border-right: 12px solid transparent;
+      border-bottom: 22px solid var(--marker-color);
+      filter: drop-shadow(0 2px 5px rgba(15, 23, 42, 0.30));
+    }}
+    .rs-blocked {{
+      border: 2px solid #ffffff;
+      border-radius: 3px;
+      height: 20px;
+      transform: rotate(45deg);
+      width: 20px;
+    }}
+    .rs-workplace {{
+      border: 3px solid #ffffff;
+      border-radius: 999px;
+      box-shadow: 0 0 0 5px rgba(15, 23, 42, 0.24), 0 3px 12px rgba(15, 23, 42, 0.30);
+      height: 30px;
+      position: relative;
+      width: 30px;
+    }}
+    .rs-workplace::after {{
+      background: #ffffff;
+      border-radius: 999px;
+      content: "";
+      height: 8px;
+      left: 11px;
+      position: absolute;
+      top: 11px;
+      width: 8px;
+    }}
+    .rs-tooltip {{
+      max-width: 300px;
+      white-space: normal;
+    }}
+    .rs-popup-title {{
+      font-weight: 700;
+      line-height: 1.35;
+      margin-bottom: 6px;
+    }}
+    .rs-popup-grid {{
+      color: #374151;
+      display: grid;
+      gap: 3px;
+      font-size: 12px;
+      grid-template-columns: 70px 1fr;
+    }}
+    .rs-popup-link {{
+      background: #111827;
+      border-radius: 6px;
+      color: #ffffff !important;
+      display: inline-block;
+      font-size: 12px;
+      margin-top: 8px;
+      padding: 6px 9px;
+      text-decoration: none;
+    }}
+    .marker-cluster-small,
+    .marker-cluster-medium,
+    .marker-cluster-large {{
+      background-color: rgba(17, 24, 39, 0.18);
+    }}
+    .marker-cluster-small div,
+    .marker-cluster-medium div,
+    .marker-cluster-large div {{
+      background-color: rgba(17, 24, 39, 0.82);
+      color: #ffffff;
+      font-weight: 700;
+    }}
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+  <script>
+    const points = {payload};
+    const map = L.map("map", {{
+      preferCanvas: false,
+      zoomControl: true,
+    }});
+    L.tileLayer("{AMAP_TILE_URL}", {{
+      maxZoom: 19,
+      minZoom: 3,
+      attribution: "© 高德地图",
+    }}).addTo(map);
+
+    const bounds = [];
+    const listingCluster = L.markerClusterGroup({{
+      chunkedLoading: true,
+      disableClusteringAtZoom: 16,
+      maxClusterRadius: 46,
+      showCoverageOnHover: false,
+      spiderfyOnMaxZoom: true,
+      zoomToBoundsOnClick: true,
+    }});
+    function markerHtml(point) {{
+      const shapeClass = point.marker_type === "workplace"
+        ? "rs-workplace"
+        : point.analysis_tier === "blocked"
+          ? "rs-blocked"
+          : point.analysis_tier === "caution"
+            ? "rs-caution"
+            : "rs-ready";
+      const background = shapeClass === "rs-caution"
+        ? ""
+        : `background:${{point.color}};`;
+      return `<span class="rs-marker" style="--marker-color:${{point.color}}">`
+        + `<span class="rs-shape ${{shapeClass}}" style="${{background}}"></span>`
+        + `</span>`;
+    }}
+    function popupHtml(point) {{
+      const title = escapeHtml(point.title || "未命名房源");
+      const rows = [
+        ["性价比", `${{point.value_level_text || "-"}} ${{point.value_score_text || "-"}}`],
+        ["质量", point.quality_text || "-"],
+        ["租金", point.rent_text || "-"],
+        ["面积", point.area_text || "-"],
+        ["单价", point.rent_per_sqm_text || "-"],
+        ["距离", point.distance_text || "-"],
+        ["空间簇", point.cluster_text || "-"],
+      ].map(([k, v]) => `<div>${{escapeHtml(k)}}</div><div>${{escapeHtml(v)}}</div>`).join("");
+      const link = point.source_url
+        ? `<a class="rs-popup-link" href="${{escapeAttribute(point.source_url)}}" `
+          + `target="_blank" rel="noopener noreferrer">打开原站链接</a>`
+        : "";
+      return `<div class="rs-tooltip"><div class="rs-popup-title">${{title}}</div>`
+        + `<div class="rs-popup-grid">${{rows}}</div>${{link}}</div>`;
+    }}
+    function escapeHtml(value) {{
+      return String(value).replace(/[&<>"']/g, (ch) => ({{
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#039;",
+      }}[ch]));
+    }}
+    function escapeAttribute(value) {{
+      return escapeHtml(value).replace(/`/g, "&#096;");
+    }}
+
+    points.forEach((point) => {{
+      if (!Number.isFinite(point.latitude) || !Number.isFinite(point.longitude)) {{
+        return;
+      }}
+      const latLng = [point.latitude, point.longitude];
+      bounds.push(latLng);
+      const size = point.marker_type === "workplace" ? [44, 44] : [32, 32];
+      const icon = L.divIcon({{
+        className: "",
+        html: markerHtml(point),
+        iconSize: size,
+        iconAnchor: [size[0] / 2, size[1] / 2],
+      }});
+      const marker = L.marker(latLng, {{ icon }});
+      marker.bindTooltip(popupHtml(point), {{
+        direction: "top",
+        offset: [0, -12],
+        opacity: 0.96,
+        sticky: true,
+      }});
+      if (point.marker_type !== "workplace" && point.source_url) {{
+        marker.on("click", () => window.open(point.source_url, "_blank", "noopener,noreferrer"));
+        listingCluster.addLayer(marker);
+      }} else {{
+        marker.bindPopup(popupHtml(point));
+        marker.addTo(map);
+      }}
+    }});
+    map.addLayer(listingCluster);
+    if (bounds.length > 1) {{
+      map.fitBounds(bounds, {{ padding: [28, 28], maxZoom: 13 }});
+    }} else if (bounds.length === 1) {{
+      map.setView(bounds[0], 13);
+    }} else {{
+      map.setView([31.2304, 121.4737], 11);
+    }}
+  </script>
+</body>
+</html>
+"""
+
+
+def _leaflet_point(row: pd.Series) -> dict[str, object]:
+    return {
+        "latitude": _json_float(row.get("latitude")),
+        "longitude": _json_float(row.get("longitude")),
+        "marker_type": str(row.get("marker_type") or "listing"),
+        "analysis_tier": str(row.get("analysis_tier") or "ready"),
+        "title": str(row.get("title") or ""),
+        "source_url": str(row.get("source_url") or ""),
+        "color": _rgba_to_css(row.get("fill_color")),
+        "rent_text": str(row.get("rent_text") or "-"),
+        "area_text": str(row.get("area_text") or "-"),
+        "rent_per_sqm_text": str(row.get("rent_per_sqm_text") or "-"),
+        "distance_text": str(row.get("distance_text") or "-"),
+        "cluster_text": str(row.get("cluster_text") or "-"),
+        "quality_text": str(row.get("quality_text") or "-"),
+        "value_score_text": str(row.get("value_score_text") or "-"),
+        "value_level_text": str(row.get("value_level_text") or "-"),
+    }
+
+
+def _json_float(value: object) -> float:
+    return float(value) if pd.notna(value) else 0.0
+
+
+def _rgba_to_css(value: object) -> str:
+    if not isinstance(value, list | tuple) or len(value) < 3:
+        return "#2563eb"
+    red, green, blue = (int(value[0]), int(value[1]), int(value[2]))
+    alpha = float(value[3]) / 255 if len(value) > 3 else 1
+    return f"rgba({red}, {green}, {blue}, {alpha:.3f})"
 
 
 def add_value_scores(frame: pd.DataFrame, weights: object) -> pd.DataFrame:
@@ -989,30 +1172,10 @@ def _map_color(row: pd.Series) -> list[int]:
     return [37, 99, 235, 210]
 
 
-def _map_shape(row: pd.Series) -> str:
-    if row.get("marker_type") == "workplace":
-        return "★"
-    tier = row.get("analysis_tier")
-    if tier == "caution":
-        return "△"
-    if tier == "blocked":
-        return "□"
-    return "●"
-
-
 def _score_text(value: object) -> str:
     if pd.isna(value):
         return "-"
     return f"{float(value):.1f}"
-
-
-def _map_view_state(frame: pd.DataFrame) -> pdk.ViewState:
-    return pdk.ViewState(
-        latitude=float(frame["latitude"].mean()),
-        longitude=float(frame["longitude"].mean()),
-        zoom=10.7,
-        pitch=0,
-    )
 
 
 def _money_text(value: object) -> str:
