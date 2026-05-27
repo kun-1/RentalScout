@@ -4,9 +4,7 @@ RentalScout 是一个面向个人租房决策的房源采集、清洗、验证�
 
 ## Demo
 
-<video src="assets/demo.mp4" controls width="100%"></video>
-
-如果当前页面不支持内嵌播放，也可以直接查看 [Demo 视频](assets/demo.mp4)。
+![Demo](assets/demo.gif)
 
 ## 项目结构
 
