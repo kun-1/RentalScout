@@ -32,6 +32,12 @@ class LandlordType(StrEnum):
     UNKNOWN = "unknown"
 
 
+class ListingAvailabilityStatus(StrEnum):
+    ACTIVE = "active"
+    OFFLINE = "offline"
+    UNKNOWN = "unknown"
+
+
 class NormalizedRentalListing(BaseModel):
     source: SourceName
     source_type: SourceType = SourceType.UGC

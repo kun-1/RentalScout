@@ -11,6 +11,13 @@ import plotly.express as px
 import streamlit as st
 import streamlit.components.v1 as components
 
+from rentalscout.analysis.commute import (
+    DEFAULT_WORKPLACE_ID,
+    DEFAULT_WORKPLACE_NAME,
+    Workplace,
+    analyze_distance_buckets,
+    resolve_workplace_from_amap,
+)
 from rentalscout.analysis.geo_clusters import (
     DEFAULT_CLUSTER_EPS_METERS,
     DEFAULT_CLUSTER_MIN_SAMPLES,
@@ -20,6 +27,9 @@ from rentalscout.analysis.geo_clusters import (
     generate_geo_cluster_outputs,
     summarize_geo_cluster_rows,
 )
+from rentalscout.analysis.price_area import analyze_price_area
+from rentalscout.analysis.wellcee_quality import analyze_wellcee_quality
+from rentalscout.schemas.raw import SourceName
 from rentalscout.settings import DATA_DIR
 from rentalscout.storage.sqlite import DEFAULT_DB_PATH, load_listings
 
@@ -29,7 +39,8 @@ DISTANCE_CSV = ANALYSIS_DIR / "commute_distance_buckets.csv"
 PRICE_AREA_CSV = ANALYSIS_DIR / "price_area_analysis.csv"
 LOCATION_VALUE_CSV = ANALYSIS_DIR / "location_value_analysis.csv"
 GEO_CLUSTER_CSV = ANALYSIS_DIR / "geo_clusters.csv"
-WORKPLACE_MARKER_TITLE = "工作中心: 上海本冠医疗美容门诊部"
+PRIVATE_DIR = DATA_DIR / "private"
+DEFAULT_WORKPLACE_JSON = PRIVATE_DIR / "workplace_default.json"
 AMAP_BASE_URL = (
     "https://wprd01.is.autonavi.com/appmaptile?"
     "x={x}&y={y}&z={z}&lang=zh_cn&size=1&scl=2&style=8"
@@ -243,6 +254,7 @@ def main() -> None:
         )
 
     data = load_all_analysis()
+    data = render_workplace_controls(data)
     missing = missing_inputs(data)
     if missing:
         st.warning("以下分析文件暂未生成: " + "、".join(str(path) for path in missing))
@@ -304,6 +316,148 @@ def missing_inputs(data: dict[str, pd.DataFrame]) -> list[Path]:
         "geo_cluster": GEO_CLUSTER_CSV,
     }
     return [path for key, path in paths.items() if data[key].empty]
+
+
+def render_workplace_controls(data: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    """渲染工作中心搜索, 并在会话内即时重算距离与性价比。"""
+
+    session_analysis = st.session_state.get("workplace_analysis")
+    if isinstance(session_analysis, dict):
+        data = {**data, **session_analysis}
+
+    current = current_workplace_from_data(data["distance"]) or load_private_default_workplace()
+    if current and session_analysis is None and data["distance"].empty:
+        data = {**data, **recompute_workplace_analysis(current)}
+
+    with st.sidebar.expander("工作中心", expanded=True):
+        default_name = current.name if current else ""
+        city = st.text_input("城市", value="上海", key="workplace_city")
+        name = st.text_input("地点", value=default_name, key="workplace_name")
+        save_as_default = st.checkbox("设为本地默认", value=False)
+        if st.button("搜索并重算", width="stretch"):
+            if not name.strip():
+                st.error("请输入工作地点。")
+            else:
+                workplace = resolve_workplace_for_ui(name=name, city=city)
+                if workplace:
+                    analysis = recompute_workplace_analysis(workplace)
+                    st.session_state["workplace_analysis"] = analysis
+                    st.session_state["current_workplace"] = workplace_to_dict(workplace)
+                    data = {**data, **analysis}
+                    if save_as_default:
+                        save_private_default_workplace(workplace)
+                    st.success(f"已切换到: {workplace.name}")
+
+        active = current_workplace_from_data(data["distance"])
+        if active:
+            st.caption(f"当前: {active.name}")
+            st.caption(f"{active.longitude:.6f}, {active.latitude:.6f}")
+        else:
+            st.caption("未设置工作中心。")
+    return data
+
+
+def resolve_workplace_for_ui(*, name: str, city: str) -> Workplace | None:
+    try:
+        return resolve_workplace_from_amap(
+            name=name.strip(),
+            workplace_id=DEFAULT_WORKPLACE_ID,
+            city=city.strip() or "上海",
+        )
+    except ValueError as error:
+        if str(error) == "invalid_workplace_location":
+            st.error("没有解析出经纬度, 请检查地理位置或补充城市/区县。")
+        elif str(error) == "missing_amap_api_key":
+            st.error("缺少 AMAP_API_KEY。请只在 .env 中保存 API key, 不要保存工作地点坐标。")
+        else:
+            st.error(f"工作地点解析失败: {error}")
+        return None
+
+
+@st.cache_data(show_spinner="正在根据工作中心重算距离和性价比...")
+def recompute_workplace_analysis(workplace: Workplace) -> dict[str, pd.DataFrame]:
+    listings = [
+        listing for listing in load_listings(DEFAULT_DB_PATH) if listing.source == SourceName.WELLCEE
+    ]
+    distance_rows = analyze_distance_buckets(listings=listings, workplace=workplace)
+    quality_rows = analyze_wellcee_quality(listings)
+    distance_buckets = {
+        row.listing_id: row.distance_bucket.value for row in distance_rows
+    }
+    price_rows = analyze_price_area(
+        listings=listings,
+        quality_rows=quality_rows,
+        distance_buckets=distance_buckets,
+    )
+    return {
+        "distance": rows_to_frame(distance_rows),
+        "price_area": rows_to_frame(price_rows),
+    }
+
+
+def rows_to_frame(rows: list[object]) -> pd.DataFrame:
+    frame = pd.DataFrame([asdict_like(row) for row in rows])
+    for column in frame.columns:
+        if frame[column].map(lambda value: hasattr(value, "value")).any():
+            frame[column] = frame[column].map(lambda value: value.value if hasattr(value, "value") else value)
+    frame = normalize_listing_id_columns(frame)
+    for column in BOOLEAN_COLUMNS.intersection(frame.columns):
+        frame[column] = frame[column].map(_to_bool)
+    return frame
+
+
+def current_workplace_from_data(distance: pd.DataFrame) -> Workplace | None:
+    if not distance.empty:
+        required = {"workplace_id", "workplace_name", "workplace_longitude", "workplace_latitude"}
+        if required.issubset(distance.columns):
+            first = distance.dropna(subset=["workplace_longitude", "workplace_latitude"]).head(1)
+            if not first.empty:
+                row = first.iloc[0]
+                return Workplace(
+                    workplace_id=str(row.get("workplace_id") or DEFAULT_WORKPLACE_ID),
+                    name=str(row.get("workplace_name") or DEFAULT_WORKPLACE_NAME),
+                    longitude=float(row["workplace_longitude"]),
+                    latitude=float(row["workplace_latitude"]),
+                )
+    saved = st.session_state.get("current_workplace")
+    if isinstance(saved, dict):
+        return workplace_from_dict(saved)
+    return None
+
+
+def load_private_default_workplace() -> Workplace | None:
+    if not DEFAULT_WORKPLACE_JSON.exists():
+        return None
+    try:
+        return workplace_from_dict(json.loads(DEFAULT_WORKPLACE_JSON.read_text(encoding="utf-8")))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def save_private_default_workplace(workplace: Workplace) -> None:
+    DEFAULT_WORKPLACE_JSON.parent.mkdir(parents=True, exist_ok=True)
+    DEFAULT_WORKPLACE_JSON.write_text(
+        json.dumps(workplace_to_dict(workplace), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def workplace_to_dict(workplace: Workplace) -> dict[str, object]:
+    return {
+        "workplace_id": workplace.workplace_id,
+        "name": workplace.name,
+        "longitude": workplace.longitude,
+        "latitude": workplace.latitude,
+    }
+
+
+def workplace_from_dict(payload: dict[str, object]) -> Workplace:
+    return Workplace(
+        workplace_id=str(payload.get("workplace_id") or DEFAULT_WORKPLACE_ID),
+        name=str(payload.get("name") or DEFAULT_WORKPLACE_NAME),
+        longitude=float(payload["longitude"]),
+        latitude=float(payload["latitude"]),
+    )
 
 
 def _bounded_range_inputs(
@@ -540,7 +694,9 @@ def _best_cluster_area_name(group: pd.DataFrame) -> str:
 def merged_listing_frame(data: dict[str, pd.DataFrame]) -> pd.DataFrame:
     """把各分析层按房源 ID 合并成前端消费表。"""
 
-    quality = data["quality"].rename(columns={"source_listing_id": "listing_id"}).copy()
+    quality = normalize_listing_id_columns(
+        data["quality"].rename(columns={"source_listing_id": "listing_id"}).copy()
+    )
     if quality.empty:
         return pd.DataFrame()
     merged = quality
@@ -602,6 +758,7 @@ def merged_listing_frame(data: dict[str, pd.DataFrame]) -> pd.DataFrame:
     ]
     for frame, columns in merge_specs:
         if not frame.empty:
+            frame = normalize_listing_id_columns(frame)
             available = [
                 column
                 for column in columns
@@ -613,6 +770,14 @@ def merged_listing_frame(data: dict[str, pd.DataFrame]) -> pd.DataFrame:
     if "longitude" not in merged.columns and "listing_longitude" in merged.columns:
         merged["longitude"] = merged["listing_longitude"]
     return merged
+
+
+def normalize_listing_id_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    normalized = frame.copy()
+    for column in ["listing_id", "source_listing_id"]:
+        if column in normalized.columns:
+            normalized[column] = normalized[column].astype(str)
+    return normalized
 
 
 def apply_listing_filters(frame: pd.DataFrame, filters: dict[str, object]) -> pd.DataFrame:
@@ -752,7 +917,7 @@ window.addEventListener('message', function(e) {
     )
 
     st.text_input(
-        "",
+        "地图选中房源",
         key="map_selected_input",
         label_visibility="collapsed",
     )
@@ -1739,8 +1904,9 @@ def workplace_marker(distance: pd.DataFrame) -> dict[str, object] | None:
     if first.empty:
         return None
     row = first.iloc[0]
+    title = str(row.get("workplace_name") or DEFAULT_WORKPLACE_NAME)
     return {
-        "title": WORKPLACE_MARKER_TITLE,
+        "title": f"工作中心: {title}",
         "latitude": float(row["workplace_latitude"]),
         "longitude": float(row["workplace_longitude"]),
         "rent_price": None,

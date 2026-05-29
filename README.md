@@ -13,6 +13,7 @@ rentalscout/
   spiders/        Scrapy 爬虫入口
   parsers/        贝壳、Wellcee 页面/API 解析
   analysis/       数据质量、通勤、价格、位置价值、空间聚类分析
+  crawl_control.py 贝壳抓取限速、指标记录与 adaptive 状态
   storage/        SQLite 本地存储
   web/            Streamlit 分析工作台
 scripts/          Cookie 提取、街道表构建等辅助脚本
@@ -41,19 +42,27 @@ Wellcee 字段合并策略为 `JSON-LD > HTML > API partial`。API 列表负责�
 
 ### 贝壳数据抓取
 
-贝壳采用列表页 HTML 抓取与正则解析：
+贝壳采用“列表页发现候选 + 详情页主解析”的两段式抓取：
 
 - 当前入口：`https://sh.zu.ke.com/zufang/pudong/rt200600000001l0brp3500erp6000/`
 - 翻页规则：第 2 页开始使用 `/pg{page}rt200600000001l0brp3500erp6000/`
 - 当前筛选条件：上海浦东、整租、一居、3500-6000 元/月
-- 原始页面保存到 `data/raw/beike/*.html`
+- 列表页原始 HTML 保存到 `data/raw/beike/*.html`
+- 详情页原始 HTML 保存到 `data/raw/beike/detail/*.html`
 
 贝壳有两套抓取路径：
 
-- `rentalscout/spiders/beike.py` 使用 Scrapy 调度，实际请求由 `curl_cffi` 以 Chrome TLS 指纹发起，并读取 `data/beike_cookies.json` 中的登录 Cookie。
-- `rentalscout/batch.py` 可调用本机 Chrome browser-tools 脚本抓取页面，带随机延迟、定期长暂停、失败重试、验证码页面检测和断点续抓。
+- `rentalscout/spiders/beike.py` 使用 Scrapy 调度，实际请求由 `curl_cffi` 以 Chrome TLS 指纹发起，并读取 `data/beike_cookies.json` 中的登录 Cookie；列表页解析后会进入详情页解析。
+- `rentalscout/batch.py` 调用本机 Chrome browser-tools 脚本抓取页面，复用真实 Chrome profile，并支持随机延迟、定期长暂停、验证码检测、人工介入提醒和断点续抓。
 
-解析层从贝壳列表卡片中提取房源 URL、标题、价格、面积、户型、行政区、板块、小区名、图片和房源 ID，并将中介来源标记为 `LandlordType.AGENCY`。
+列表页只用于提取房源 URL、房源 ID、标题、价格和基础区域信息，并先做一次粗过滤；只有符合目标条件的候选才会请求详情页。详情页解析价格、面积、户型、楼层、朝向、入住时间、地铁、经纬度、小区名和板块，并将中介来源标记为 `LandlordType.AGENCY`。贝壳不保存图片 URL，查看图片时直接跳转 `source_url` 到原始详情页。
+
+贝壳批量抓取还会写入真实运行指标：
+
+- `data/crawl_runs/beike_metrics.jsonl`：记录列表页和详情页请求结果、耗时、HTML 大小、captcha、缓存复用和 raw path。
+- `data/crawl_runs/beike_state.json`：在 `--beike-adaptive` 模式下记录下一次建议使用的更慢抓取档位。
+
+内置限速档位包括 `fast`、`balanced`、`safe` 和 `ultra`。遇到 captcha 时，抓取会停止、发出终端响铃和 macOS 通知，并把触发 captcha 的 URL 打开到 Chrome 新标签，方便人工处理。重新运行同一命令时，已保存的列表页和详情页 HTML 会被复用，不会重复下载。
 
 ### 本地存储
 
@@ -82,21 +91,17 @@ SQLite 表结构保持轻量：
 
 质量结果会分为 `ready`、`caution`、`blocked` 三档，并导出 `data/analysis/wellcee_quality.csv` 和摘要 JSON。
 
-### 通勤与距离分析
+### 工作中心与距离分析
 
-`commute.py` 结合高德地图 Web 服务 API 和本地距离算法计算通勤指标：
+`commute.py` 结合高德地图 Web 服务 API 和本地距离算法计算工作中心相关指标：
 
 - `resolve-workplace` 调用高德地理编码 API，将工作地点名称解析为经纬度。
 - `analyze-distance-buckets` 使用 Haversine 公式计算房源到工作地点的球面直线距离。
 - 距离分桶：`within_4km`、`4_to_8km`、`8_to_12km`、`over_12km`。
-- `analyze-commute` 调用高德步行与骑行路线 API：
-  - 4km 内计算步行和骑行。
-  - 4-12km 计算骑行。
-  - 12km 外默认跳过精算。
-- 路线状态分层：`ready`、`caution`、`skipped`、`failed`。
-- 当高德路线距离超过直线距离的 2.5 倍或多出 3000 米以上时标记为 `caution`。
 
-高德原始响应会保存到 `data/raw/amap/`，便于复核 API 返回。
+工作中心坐标不写入 `.env`，避免泄露隐私位置；`.env` 只需要保存 `AMAP_API_KEY`。工作台中切换工作中心后，会即时重算直线距离、距离分桶和同距离桶内的价格/面积性价比。
+
+高德地理编码原始响应会保存到 `data/raw/amap/`，便于复核 API 返回。
 
 ### 价格与面积分析
 
@@ -146,7 +151,7 @@ uv run streamlit run rentalscout/web/streamlit_app.py
 
 工作台包含：
 
-- 地图视图：基于 pydeck 渲染房源点位，并使用高德瓦片作为底图。
+- 地图视图：基于 Leaflet 渲染房源点位，并使用高德瓦片作为底图。
 - 质量页：查看 ready/caution/blocked 和字段缺失风险。
 - 距离页：查看工作地点直线距离分桶。
 - 价格面积页：查看租金、单价、分位数和异常标签。
@@ -178,7 +183,17 @@ uv run python -m rentalscout.cli scrapy-crawl wellcee --pages 3
 
 ```bash
 uv run python scripts/extract_cookies.py
-uv run python -m rentalscout.cli scrapy-crawl beike --start-page 1 --pages 3
+uv run python -m rentalscout.cli crawl-phase1 --beike-pages 20 --wellcee-pages 0 --beike-profile safe --beike-adaptive
+```
+
+贝壳抓取支持手动调参和 profile 调参。推荐先从 `balanced` 开始试跑；如果在详情页阶段触发 captcha，则切换到 `safe` 或继续使用 `--beike-adaptive` 读取上次建议档位：
+
+```bash
+uv run python -m rentalscout.cli crawl-phase1 \
+  --beike-pages 20 \
+  --wellcee-pages 0 \
+  --beike-profile balanced \
+  --beike-adaptive
 ```
 
 生成质量分析：
@@ -196,13 +211,7 @@ uv run python -m rentalscout.cli resolve-workplace --amap-key YOUR_AMAP_KEY
 生成距离分桶：
 
 ```bash
-uv run python -m rentalscout.cli analyze-distance-buckets
-```
-
-生成步行/骑行通勤分析：
-
-```bash
-uv run python -m rentalscout.cli analyze-commute --amap-key YOUR_AMAP_KEY
+uv run python -m rentalscout.cli analyze-distance-buckets --workplace-lng YOUR_LNG --workplace-lat YOUR_LAT
 ```
 
 生成价格面积分析：
@@ -239,28 +248,16 @@ uv run pytest
 - SQLite
 - pandas
 - Streamlit
-- pydeck
+- Leaflet
 - pytest / Ruff
 
 ## 当前边界
 
-- 当前分析主路径以 Wellcee 为主，贝壳数据已可抓取和入库，但经纬度与详情字段不如 Wellcee 完整。
+- 当前分析主路径仍以 Wellcee 为主；贝壳已经支持详情页抓取和经纬度解析，但受目标站反爬和验证码影响，需要低频、分批、可恢复地运行。
 - 高德路线分析需要 `AMAP_API_KEY`；没有 key 时可以先运行直线距离分桶和其他离线分析。
 - 数据采集用于个人研究和租房辅助决策，应遵守目标网站服务条款，控制频率，避免高压抓取。
 
-## 下一步规划
-
-### 扩大数据源到贝壳租房
-
-下一阶段会把数据源从 Wellcee 主路径扩展到贝壳租房网站，使贝壳从“可抓取的辅助来源”升级为稳定的数据来源：
-
-- 完善贝壳列表页抓取，覆盖更多浦东租房筛选条件和翻页范围。
-- 补齐贝壳详情字段解析，包括面积、楼层、朝向、维护时间、地铁信息和小区信息。
-- 将贝壳房源统一写入 `NormalizedRentalListing`，保证与 Wellcee 共用同一套存储、过滤和分析接口。
-- 增强去重逻辑，按来源 ID、标题、租金、小区、面积等字段识别跨平台重复房源。
-- 对贝壳缺失经纬度的房源，后续可结合小区名、地址文本和高德地理编码补齐位置字段。
-
-### 定时更新数据
+## 下一步: 定时更新数据
 
 后续会新增定时更新数据脚本，用于周期性刷新房源状态并沉淀历史变化：
 

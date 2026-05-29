@@ -10,12 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 
 import scrapy
 from curl_cffi import requests as curl_requests
 
-from rentalscout.parsers.beike import parse_beike_listings
+from rentalscout.parsers.beike import parse_beike_detail, parse_beike_listings
+from rentalscout.schemas.normalized import NormalizedRentalListing
+from rentalscout.settings import RAW_DATA_DIR
 
 DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 COOKIE_PATH = DATA_DIR / "beike_cookies.json"
@@ -97,7 +101,8 @@ class BeikeSpider(scrapy.Spider):
                     len(html),
                 )
                 for listing in listings:
-                    yield listing
+                    detail_listing = await self._fetch_detail(session, listing)
+                    yield detail_listing or listing
 
                 # Anti-ban delay
                 if page_num < self.max_pages:
@@ -105,3 +110,51 @@ class BeikeSpider(scrapy.Spider):
 
         finally:
             session.close()
+
+    async def _fetch_detail(
+        self,
+        session: curl_requests.Session,
+        listing: NormalizedRentalListing,
+    ) -> NormalizedRentalListing | None:
+        url = str(listing.source_url)
+        resp = await asyncio.to_thread(
+            session.request,
+            method="GET",
+            url=url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/148.0.7778.179 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.5",
+            },
+            cookies=self.beike_cookies,
+            impersonate="chrome",
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            self.logger.warning("Detail %s: HTTP %d", listing.source_listing_id, resp.status_code)
+            return None
+        raw_path = _save_raw_detail(resp.text, listing.source_listing_id or "unknown")
+        self.logger.info("Detail %s: saved %s", listing.source_listing_id, raw_path.name)
+        detail = parse_beike_detail(resp.text, url, fallback=listing)
+        if detail is None:
+            self.logger.warning("Detail %s: parse failed", listing.source_listing_id)
+            return None
+        await asyncio.sleep(3 + hash(url) % 3)
+        return detail
+
+
+def _save_raw_detail(body: str, source_listing_id: str) -> Path:
+    digest = sha256(body.encode("utf-8")).hexdigest()
+    source_dir = RAW_DATA_DIR / "beike" / "detail"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    fetched_at = datetime.now(UTC)
+    raw_path = (
+        source_dir
+        / f"{fetched_at.strftime('%Y%m%dT%H%M%SZ')}-{source_listing_id}-{digest[:12]}.html"
+    )
+    raw_path.write_text(body, encoding="utf-8")
+    return raw_path

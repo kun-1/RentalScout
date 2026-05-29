@@ -11,14 +11,11 @@ from pathlib import Path
 from scrapy.crawler import CrawlerProcess
 
 from rentalscout.analysis.commute import (
-    DEFAULT_COMMUTE_CSV,
-    DEFAULT_COMMUTE_SUMMARY_JSON,
     DEFAULT_DISTANCE_BUCKET_CSV,
     DEFAULT_DISTANCE_BUCKET_SUMMARY_JSON,
     DEFAULT_WORKPLACE_ID,
     DEFAULT_WORKPLACE_NAME,
     Workplace,
-    generate_commute_outputs,
     generate_distance_bucket_outputs,
     resolve_workplace_from_amap,
 )
@@ -45,7 +42,8 @@ from rentalscout.analysis.wellcee_quality import (
     DEFAULT_WELLCEE_QUALITY_SUMMARY_JSON,
     generate_wellcee_quality_outputs,
 )
-from rentalscout.batch import scrape_beike_pages, scrape_wellcee_pages
+from rentalscout.batch import scrape_beike_detail_listings, scrape_beike_pages, scrape_wellcee_pages
+from rentalscout.crawl_control import BeikeCrawlControl, beike_profile_names
 from rentalscout.fetch import fetch_public_page
 from rentalscout.filters import ListingFilterResult, apply_phase1_filters
 from rentalscout.inspect import summarize_html
@@ -53,7 +51,6 @@ from rentalscout.parsers.beike import parse_beike_listings
 from rentalscout.parsers.wellcee import parse_wellcee_detail_title
 from rentalscout.schemas.normalized import ListingType, NormalizedRentalListing
 from rentalscout.schemas.raw import SourceName
-from rentalscout.settings import load_dotenv
 from rentalscout.sources import DEFAULT_SOURCE_ENTRIES
 from rentalscout.spiders.beike import BeikeSpider
 from rentalscout.spiders.wellcee import WellceeSpider
@@ -90,6 +87,65 @@ def main(argv: Sequence[str] | None = None) -> int:
     crawl_parser.add_argument("--beike-retries", type=int, default=3, help="每页重试次数")
     crawl_parser.add_argument("--beike-delay-min", type=float, default=10.0, help="翻页间隔最小值")
     crawl_parser.add_argument("--beike-delay-max", type=float, default=15.0, help="翻页间隔最大值")
+    crawl_parser.add_argument(
+        "--beike-profile",
+        choices=beike_profile_names(),
+        default=None,
+        help="贝壳抓取限速档位; 传入后覆盖手动 delay 参数",
+    )
+    crawl_parser.add_argument(
+        "--beike-adaptive",
+        action="store_true",
+        help="遇到 captcha 后记录下一次建议使用的更慢档位",
+    )
+    crawl_parser.add_argument(
+        "--beike-list-delay-min",
+        type=float,
+        default=None,
+        help="贝壳列表页请求间隔最小秒数; 未设置时沿用 --beike-delay-min",
+    )
+    crawl_parser.add_argument(
+        "--beike-list-delay-max",
+        type=float,
+        default=None,
+        help="贝壳列表页请求间隔最大秒数; 未设置时沿用 --beike-delay-max",
+    )
+    crawl_parser.add_argument(
+        "--beike-detail-delay-min",
+        type=float,
+        default=None,
+        help="贝壳详情页请求间隔最小秒数; 未设置时沿用 --beike-delay-min",
+    )
+    crawl_parser.add_argument(
+        "--beike-detail-delay-max",
+        type=float,
+        default=None,
+        help="贝壳详情页请求间隔最大秒数; 未设置时沿用 --beike-delay-max",
+    )
+    crawl_parser.add_argument(
+        "--beike-human-break-every",
+        type=int,
+        default=7,
+        help="贝壳每抓取多少个列表页后长暂停一次",
+    )
+    crawl_parser.add_argument(
+        "--beike-human-break-min",
+        type=float,
+        default=60.0,
+        help="贝壳长暂停最小秒数",
+    )
+    crawl_parser.add_argument(
+        "--beike-human-break-max",
+        type=float,
+        default=120.0,
+        help="贝壳长暂停最大秒数",
+    )
+    crawl_parser.add_argument(
+        "--beike-detail-limit",
+        type=int,
+        default=None,
+        help="贝壳详情页抓取上限, 默认抓取所有通过粗过滤的候选",
+    )
     crawl_parser.add_argument("--wellcee-pages", type=int, default=None, help="Wellcee pages")
     crawl_parser.add_argument("--wellcee-retries", type=int, default=3, help="每页 API 重试次数")
     crawl_parser.add_argument("--detail-limit", type=int, default=12, help="Wellcee 详情页抓取上限")
@@ -109,37 +165,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--summary-path",
         default=str(DEFAULT_WELLCEE_QUALITY_SUMMARY_JSON),
         help="质量摘要 JSON 输出路径",
-    )
-
-    commute_parser = subparsers.add_parser("analyze-commute", help="生成步行与骑行通勤分析")
-    commute_parser.add_argument("--db-path", default=str(DEFAULT_DB_PATH), help="SQLite 数据库路径")
-    commute_parser.add_argument(
-        "--workplace-id",
-        default=DEFAULT_WORKPLACE_ID,
-        help="工作地点 ID",
-    )
-    commute_parser.add_argument(
-        "--workplace-name",
-        default=DEFAULT_WORKPLACE_NAME,
-        help="工作地点名称",
-    )
-    commute_parser.add_argument("--workplace-lng", type=float, default=None, help="工作地点经度")
-    commute_parser.add_argument("--workplace-lat", type=float, default=None, help="工作地点纬度")
-    commute_parser.add_argument("--amap-key", default=None, help="高德 Web 服务 API key")
-    commute_parser.add_argument(
-        "--csv-path",
-        default=str(DEFAULT_COMMUTE_CSV),
-        help="通勤结果 CSV 输出路径",
-    )
-    commute_parser.add_argument(
-        "--summary-path",
-        default=str(DEFAULT_COMMUTE_SUMMARY_JSON),
-        help="通勤摘要 JSON 输出路径",
-    )
-    commute_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="只做分桶和跳过策略, 不请求高德",
     )
 
     geocode_parser = subparsers.add_parser("resolve-workplace", help="用高德解析工作地点坐标")
@@ -281,6 +306,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             beike_retries=args.beike_retries,
             beike_delay_min=args.beike_delay_min,
             beike_delay_max=args.beike_delay_max,
+            beike_profile=args.beike_profile,
+            beike_adaptive=args.beike_adaptive,
+            beike_list_delay_min=args.beike_list_delay_min,
+            beike_list_delay_max=args.beike_list_delay_max,
+            beike_detail_delay_min=args.beike_detail_delay_min,
+            beike_detail_delay_max=args.beike_detail_delay_max,
+            beike_human_break_every=args.beike_human_break_every,
+            beike_human_break_min=args.beike_human_break_min,
+            beike_human_break_max=args.beike_human_break_max,
+            beike_detail_limit=args.beike_detail_limit,
             wellcee_pages=args.wellcee_pages,
             wellcee_retries=args.wellcee_retries,
             detail_limit=args.detail_limit,
@@ -291,18 +326,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             db_path=args.db_path,
             csv_path=args.csv_path,
             summary_path=args.summary_path,
-        )
-    if args.command == "analyze-commute":
-        return analyze_commute_command(
-            db_path=args.db_path,
-            workplace_id=args.workplace_id,
-            workplace_name=args.workplace_name,
-            workplace_lng=args.workplace_lng,
-            workplace_lat=args.workplace_lat,
-            amap_key=args.amap_key,
-            csv_path=args.csv_path,
-            summary_path=args.summary_path,
-            dry_run=args.dry_run,
         )
     if args.command == "resolve-workplace":
         return resolve_workplace_command(
@@ -367,57 +390,6 @@ def analyze_wellcee_quality_command(*, db_path: str, csv_path: str, summary_path
     return 0
 
 
-def analyze_commute_command(
-    *,
-    db_path: str,
-    workplace_id: str,
-    workplace_name: str,
-    workplace_lng: float,
-    workplace_lat: float,
-    amap_key: str | None,
-    csv_path: str,
-    summary_path: str,
-    dry_run: bool,
-) -> int:
-    """生成步行与骑行通勤分析输出。"""
-
-    env_values = load_dotenv()
-    resolved_lng = workplace_lng or _float_env(env_values.get("AMAP_WORKPLACE_LNG"))
-    resolved_lat = workplace_lat or _float_env(env_values.get("AMAP_WORKPLACE_LAT"))
-    if resolved_lng is None or resolved_lat is None:
-        print("缺少工作地点坐标: 请传入 --workplace-lng/--workplace-lat, 或在 .env 中设置")
-        print("AMAP_WORKPLACE_LNG=经度")
-        print("AMAP_WORKPLACE_LAT=纬度")
-        return 2
-
-    workplace = Workplace(
-        workplace_id=workplace_id,
-        name=workplace_name,
-        longitude=resolved_lng,
-        latitude=resolved_lat,
-    )
-    rows, summary = generate_commute_outputs(
-        workplace=workplace,
-        db_path=Path(db_path),
-        api_key=amap_key,
-        csv_path=Path(csv_path),
-        summary_path=Path(summary_path),
-        dry_run=dry_run,
-    )
-    print("## 通勤分析")
-    print(f"- 输入 SQLite: {db_path}")
-    print(f"- 工作地点: {workplace_name} ({resolved_lng}, {resolved_lat})")
-    print(f"- 结果数量: {len(rows)}")
-    print(f"- 房源数量: {summary['unique_listings']}")
-    print(f"- ready: {summary['statuses']['ready']}")
-    print(f"- caution: {summary['statuses']['caution']}")
-    print(f"- skipped: {summary['statuses']['skipped']}")
-    print(f"- failed: {summary['statuses']['failed']}")
-    print(f"- 明细 CSV: {csv_path}")
-    print(f"- 摘要 JSON: {summary_path}")
-    return 0
-
-
 def resolve_workplace_command(
     *,
     workplace_id: str,
@@ -443,10 +415,6 @@ def resolve_workplace_command(
     print(f"- 名称: {workplace.name}")
     print(f"- 经度: {workplace.longitude}")
     print(f"- 纬度: {workplace.latitude}")
-    print()
-    print("可写入 .env:")
-    print(f"AMAP_WORKPLACE_LNG={workplace.longitude}")
-    print(f"AMAP_WORKPLACE_LAT={workplace.latitude}")
     return 0
 
 
@@ -462,13 +430,11 @@ def analyze_distance_buckets_command(
 ) -> int:
     """生成直线距离分桶输出。"""
 
-    env_values = load_dotenv()
-    resolved_lng = workplace_lng or _float_env(env_values.get("AMAP_WORKPLACE_LNG"))
-    resolved_lat = workplace_lat or _float_env(env_values.get("AMAP_WORKPLACE_LAT"))
+    resolved_lng = workplace_lng
+    resolved_lat = workplace_lat
     if resolved_lng is None or resolved_lat is None:
-        print("缺少工作地点坐标: 请先运行 resolve-workplace, 或在 .env 中设置")
-        print("AMAP_WORKPLACE_LNG=经度")
-        print("AMAP_WORKPLACE_LAT=纬度")
+        print("缺少工作地点坐标: 请传入 --workplace-lng 和 --workplace-lat")
+        print("工作地点坐标不会从 .env 读取, 避免泄露隐私位置。")
         return 2
 
     workplace = Workplace(
@@ -591,15 +557,6 @@ def analyze_geo_clusters_command(
     return 0
 
 
-def _float_env(value: str | None) -> float | None:
-    if not value:
-        return None
-    try:
-        return float(value)
-    except ValueError:
-        return None
-
-
 def scout_sources() -> int:
     exit_code = 0
 
@@ -680,6 +637,16 @@ def crawl_phase1(
     beike_retries: int = 3,
     beike_delay_min: float = 5.0,
     beike_delay_max: float = 8.0,
+    beike_profile: str | None = None,
+    beike_adaptive: bool = False,
+    beike_list_delay_min: float | None = None,
+    beike_list_delay_max: float | None = None,
+    beike_detail_delay_min: float | None = None,
+    beike_detail_delay_max: float | None = None,
+    beike_human_break_every: int = 7,
+    beike_human_break_min: float = 60.0,
+    beike_human_break_max: float = 120.0,
+    beike_detail_limit: int | None = None,
     wellcee_pages: int | None = None,
     wellcee_retries: int = 3,
     detail_limit: int = 12,
@@ -692,25 +659,77 @@ def crawl_phase1(
 
     # -- Beike batch --
     start_info = beike_start_page or "auto"
+    list_delay_range = (
+        beike_list_delay_min or beike_delay_min,
+        beike_list_delay_max or beike_delay_max,
+    )
+    detail_delay_range = (
+        beike_detail_delay_min or beike_delay_min,
+        beike_detail_delay_max or beike_delay_max,
+    )
+    list_control = BeikeCrawlControl(
+        profile_name=beike_profile,
+        adaptive=beike_adaptive,
+        delay_range=list_delay_range,
+        human_break_every=beike_human_break_every,
+        human_break_range=(beike_human_break_min, beike_human_break_max),
+    )
+    detail_control = BeikeCrawlControl(
+        profile_name=beike_profile,
+        adaptive=beike_adaptive,
+        delay_range=detail_delay_range,
+        human_break_every=beike_human_break_every,
+        human_break_range=(beike_human_break_min, beike_human_break_max),
+    )
     print(f"## Beike batch (pages {start_info}-{beike_pages})")
-    print(f"- delay: {beike_delay_min}-{beike_delay_max}s")
+    print(f"- profile: {beike_profile or 'manual'}")
+    print(f"- list delay: {list_control.delay_range[0]}-{list_control.delay_range[1]}s")
+    print(f"- detail delay: {detail_control.delay_range[0]}-{detail_control.delay_range[1]}s")
     beike_parsed: list[NormalizedRentalListing] = []
+    beike_detail_seen = 0
     for page_num, html in scrape_beike_pages(
         start_page=beike_start_page,
         max_pages=beike_pages,
         retry_attempts=beike_retries,
-        delay_range=(beike_delay_min, beike_delay_max),
+        delay_range=list_control.delay_range,
+        human_break_every=beike_human_break_every,
+        human_break_range=(beike_human_break_min, beike_human_break_max),
+        crawl_control=list_control,
     ):
         parsed = parse_beike_listings(html, "https://sh.zu.ke.com")
         beike_parsed.extend(parsed)
         print(f"  Page {page_num}: {len(parsed)} listings parsed")
+        beike_pre_results = [apply_phase1_filters(listing) for listing in parsed]
+        beike_candidates = [r.listing for r in beike_pre_results if r.accepted]
+        if beike_detail_limit is not None:
+            remaining = beike_detail_limit - beike_detail_seen
+            beike_candidates = [] if remaining <= 0 else beike_candidates[:remaining]
+        print(f"  Page {page_num}: {len(beike_candidates)} detail candidates")
 
+        filter_results.extend(r for r in beike_pre_results if not r.accepted)
+        for detail_listing in scrape_beike_detail_listings(
+            beike_candidates,
+            retry_attempts=beike_retries,
+            delay_range=detail_control.delay_range,
+            crawl_control=detail_control,
+        ):
+            beike_detail_seen += 1
+            detail_result = apply_phase1_filters(detail_listing)
+            filter_results.append(detail_result)
+            if not detail_result.accepted:
+                continue
+            accepted.append(detail_result.listing)
+            if not dry_run:
+                upsert_listings([detail_result.listing])
+
+    beike_accepted_count = sum(
+        1
+        for result in filter_results
+        if result.listing.source == SourceName.BEIKE and result.accepted
+    )
     print(f"- beike total parsed: {len(beike_parsed)}")
-    beike_results = [apply_phase1_filters(listing) for listing in beike_parsed]
-    beike_accepted = [r.listing for r in beike_results if r.accepted]
-    print(f"- accepted after filter: {len(beike_accepted)}")
-    filter_results.extend(beike_results)
-    accepted.extend(beike_accepted)
+    print(f"- detail pages parsed or reused: {beike_detail_seen}")
+    print(f"- accepted after detail filter: {beike_accepted_count}")
     print()
 
     # -- Wellcee batch --

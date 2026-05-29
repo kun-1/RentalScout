@@ -13,6 +13,9 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 
+from rentalscout.crawl_control import BeikeCrawlControl
+from rentalscout.parsers.beike import parse_beike_detail
+from rentalscout.schemas.normalized import NormalizedRentalListing
 from rentalscout.settings import RAW_DATA_DIR
 from rentalscout.wellcee_api import (
     WELLCEE_HOUSE_API_URL,
@@ -28,6 +31,7 @@ logger = logging.getLogger(__name__)
 BROWSER_TOOLS_DIR = Path.home() / ".claude" / "skills" / "browser-tools"
 BEIKE_SCRAPE_JS = str(BROWSER_TOOLS_DIR / "beike-scrape.js")
 BROWSER_START_JS = str(BROWSER_TOOLS_DIR / "browser-start.js")
+BROWSER_NAV_JS = str(BROWSER_TOOLS_DIR / "browser-nav.js")
 BEIKE_PHASE1_BASE = "https://sh.zu.ke.com/zufang/pudong"
 BEIKE_PHASE1_SUFFIX = "rt200600000001l0brp3500erp6000"
 
@@ -63,6 +67,14 @@ def _detect_beike_start_page(output_dir: Path = RAW_DATA_DIR) -> int:
     return page
 
 
+def _latest_raw_page(page_num: int, output_dir: Path = RAW_DATA_DIR) -> Path | None:
+    beike_dir = output_dir / "beike"
+    if not beike_dir.is_dir():
+        return None
+    matches = sorted(beike_dir.glob(f"*-page{page_num}-*.html"))
+    return matches[-1] if matches else None
+
+
 # ---------------------------------------------------------------------------
 # Chrome lifecycle
 # ---------------------------------------------------------------------------
@@ -95,6 +107,34 @@ def _chrome_restart() -> None:
         pass
     _ensure_chrome_running()
     time.sleep(3)
+
+
+def _notify_manual_intervention(message: str) -> None:
+    logger.error("%s", message)
+    print("\a", end="", flush=True)
+    try:
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                f'display notification "{message}" with title "RentalScout captcha"',
+            ],
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        logger.info("macOS notification failed; relying on terminal message")
+
+
+def _open_url_for_manual_intervention(url: str) -> None:
+    try:
+        subprocess.run(
+            [BROWSER_NAV_JS, url, "--new"],
+            timeout=15,
+            check=False,
+        )
+    except Exception:
+        logger.info("Failed to open captcha URL in browser: %s", url)
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +175,34 @@ def _save_raw_page(
     return raw_path
 
 
+def _save_raw_detail(
+    body: str,
+    source_listing_id: str,
+    output_dir: Path = RAW_DATA_DIR,
+) -> Path:
+    digest = sha256(body.encode("utf-8")).hexdigest()
+    source_dir = output_dir / "beike" / "detail"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    fetched_at = datetime.now(UTC)
+    ts = fetched_at.strftime("%Y%m%dT%H%M%SZ")
+    raw_path = source_dir / f"{ts}-{source_listing_id}-{digest[:12]}.html"
+    raw_path.write_text(body, encoding="utf-8")
+    return raw_path
+
+
+def _latest_raw_detail(
+    source_listing_id: str | None,
+    output_dir: Path = RAW_DATA_DIR,
+) -> Path | None:
+    if not source_listing_id:
+        return None
+    detail_dir = output_dir / "beike" / "detail"
+    if not detail_dir.is_dir():
+        return None
+    matches = sorted(detail_dir.glob(f"*-{source_listing_id}-*.html"))
+    return matches[-1] if matches else None
+
+
 # ---------------------------------------------------------------------------
 # Beike batch scraper
 # ---------------------------------------------------------------------------
@@ -148,6 +216,7 @@ def scrape_beike_pages(
     delay_range: tuple[float, float] = (10.0, 15.0),
     human_break_every: int = 7,
     human_break_range: tuple[float, float] = (60.0, 120.0),
+    crawl_control: BeikeCrawlControl | None = None,
 ) -> Generator[tuple[int, str]]:
     """Yield (page_num, html_body) for each successfully scraped Beike page.
 
@@ -162,9 +231,15 @@ def scrape_beike_pages(
     - Sanity check on extracted HTML before yielding
     """
     _ensure_chrome_running()
+    control = crawl_control or BeikeCrawlControl(
+        delay_range=delay_range,
+        human_break_every=human_break_every,
+        human_break_range=human_break_range,
+    )
 
+    explicit_start_page = start_page is not None
     if start_page is None:
-        start_page = _detect_beike_start_page()
+        start_page = 1
     if start_page > max_pages:
         logger.info(
             "All pages already scraped (start=%d > max=%d)",
@@ -187,10 +262,24 @@ def scrape_beike_pages(
 
     for page_num in range(start_page, max_pages + 1):
         url = _build_beike_url(page_num)
+        cached_path = None if explicit_start_page else _latest_raw_page(page_num)
+        if cached_path is not None:
+            logger.info("Page %d/%d: reuse cached %s", page_num, max_pages, cached_path.name)
+            control.log_event(
+                "cache_reuse",
+                kind="list",
+                page=page_num,
+                raw_path=str(cached_path),
+            )
+            yield (page_num, cached_path.read_text(encoding="utf-8", errors="replace"))
+            continue
+
         html: str | None = None
+        captcha_seen = False
 
         tmp_html = Path(f"/tmp/beike_batch_page{page_num}.html")
         for attempt in range(1, retry_attempts + 1):
+            started_at = time.monotonic()
             try:
                 tmp_html.parent.mkdir(parents=True, exist_ok=True)
                 with tmp_html.open("wb") as stdout_file:
@@ -207,6 +296,17 @@ def scrape_beike_pages(
                     if _looks_like_listings(page_html):
                         html = page_html
                         raw_path = _save_raw_page(html, source="beike", page_num=page_num)
+                        control.log_event(
+                            "request",
+                            kind="list",
+                            status="ok",
+                            page=page_num,
+                            attempt=attempt,
+                            elapsed_seconds=round(time.monotonic() - started_at, 3),
+                            html_bytes=len(page_html),
+                            raw_path=str(raw_path),
+                        )
+                        control.record_success(kind="list", label=page_num)
                         succeeded += 1
                         logger.info(
                             "Page %d/%d: OK (%d bytes) → %s",
@@ -217,15 +317,34 @@ def scrape_beike_pages(
                         )
                         break
                     if _is_captcha_page(page_html):
+                        captcha_seen = True
+                        control.log_event(
+                            "request",
+                            kind="list",
+                            status="captcha",
+                            page=page_num,
+                            attempt=attempt,
+                            elapsed_seconds=round(time.monotonic() - started_at, 3),
+                            html_bytes=len(page_html),
+                        )
                         logger.warning(
-                            "Page %d: captcha (%d bytes, attempt %d/%d), waiting 120s",
+                            "Page %d: captcha (%d bytes, attempt %d/%d), stopping",
                             page_num,
                             len(page_html),
                             attempt,
                             retry_attempts,
                         )
-                        time.sleep(120)
+                        break
                     else:
+                        control.log_event(
+                            "request",
+                            kind="list",
+                            status="unexpected",
+                            page=page_num,
+                            attempt=attempt,
+                            elapsed_seconds=round(time.monotonic() - started_at, 3),
+                            html_bytes=len(page_html),
+                        )
                         logger.warning(
                             "Page %d: no listing cards (%d bytes, attempt %d/%d)",
                             page_num,
@@ -235,6 +354,14 @@ def scrape_beike_pages(
                         )
                         _chrome_restart()
                 elif proc.returncode == 2:
+                    control.log_event(
+                        "request",
+                        kind="list",
+                        status="browser_disconnected",
+                        page=page_num,
+                        attempt=attempt,
+                        elapsed_seconds=round(time.monotonic() - started_at, 3),
+                    )
                     logger.warning(
                         "Page %d: browser disconnected (attempt %d/%d)",
                         page_num,
@@ -243,6 +370,15 @@ def scrape_beike_pages(
                     )
                     _chrome_restart()
                 else:
+                    control.log_event(
+                        "request",
+                        kind="list",
+                        status="exit",
+                        page=page_num,
+                        attempt=attempt,
+                        exit_code=proc.returncode,
+                        elapsed_seconds=round(time.monotonic() - started_at, 3),
+                    )
                     logger.warning(
                         "Page %d: exit %d (attempt %d/%d)",
                         page_num,
@@ -252,6 +388,14 @@ def scrape_beike_pages(
                     )
             except subprocess.TimeoutExpired:
                 tmp_html.unlink(missing_ok=True)
+                control.log_event(
+                    "request",
+                    kind="list",
+                    status="timeout",
+                    page=page_num,
+                    attempt=attempt,
+                    elapsed_seconds=round(time.monotonic() - started_at, 3),
+                )
                 logger.warning(
                     "Page %d: timeout (attempt %d/%d)",
                     page_num,
@@ -262,18 +406,20 @@ def scrape_beike_pages(
         if html is None:
             failed_pages.append(page_num)
             logger.error("Page %d: ALL %d attempts failed, skipping", page_num, retry_attempts)
+            if captcha_seen:
+                next_profile = control.record_captcha(kind="list", label=page_num)
+                _open_url_for_manual_intervention(url)
+                _notify_manual_intervention(
+                    f"Page {page_num}: captcha persisted; next suggested profile={next_profile}"
+                )
+                break
         else:
             yield (page_num, html)
 
-        # Anti-ban: random delay with micro-jitter (always runs, even after failure)
-        delay = random.uniform(*delay_range) + random.uniform(0, 0.2)
-        time.sleep(delay)
-
-        # Anti-ban: "human break" pause every N pages
-        if page_num % human_break_every == 0 and page_num < max_pages:
-            break_time = random.uniform(*human_break_range)
+        control.sleep_between_requests(kind="list", label=page_num)
+        break_time = control.maybe_human_break(page_num, max_pages)
+        if break_time is not None:
             logger.info("Human break %d: %.0fs pause", page_num, break_time)
-            time.sleep(break_time)
 
     logger.info(
         "Beike batch done: %d/%d succeeded, failed=%s",
@@ -281,6 +427,220 @@ def scrape_beike_pages(
         max_pages,
         failed_pages or "none",
     )
+
+
+def scrape_beike_detail_listings(
+    listings: list[NormalizedRentalListing],
+    *,
+    retry_attempts: int = 3,
+    delay_range: tuple[float, float] = (8.0, 12.0),
+    output_dir: Path = RAW_DATA_DIR,
+    crawl_control: BeikeCrawlControl | None = None,
+) -> Generator[NormalizedRentalListing]:
+    """Fetch Beike detail pages and yield detail-enriched listings."""
+    if not listings:
+        return
+
+    _ensure_chrome_running()
+    control = crawl_control or BeikeCrawlControl(delay_range=delay_range)
+
+    seen_urls: set[str] = set()
+    failed_urls: list[str] = []
+
+    for index, listing in enumerate(listings, start=1):
+        url = str(listing.source_url)
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+
+        cached_path = _latest_raw_detail(listing.source_listing_id, output_dir)
+        if cached_path is not None:
+            cached_html = cached_path.read_text(encoding="utf-8", errors="replace")
+            parsed = parse_beike_detail(cached_html, url, fallback=listing)
+            if parsed is not None:
+                control.log_event(
+                    "cache_reuse",
+                    kind="detail",
+                    source_listing_id=listing.source_listing_id,
+                    raw_path=str(cached_path),
+                )
+                logger.info(
+                    "Detail %d/%d: reuse cached %s",
+                    index,
+                    len(listings),
+                    cached_path.name,
+                )
+                yield parsed
+                continue
+
+        html: str | None = None
+        captcha_seen = False
+        tmp_html = Path(f"/tmp/beike_detail_{listing.source_listing_id or index}.html")
+        for attempt in range(1, retry_attempts + 1):
+            started_at = time.monotonic()
+            try:
+                tmp_html.parent.mkdir(parents=True, exist_ok=True)
+                with tmp_html.open("wb") as stdout_file:
+                    proc = subprocess.run(
+                        [BEIKE_SCRAPE_JS, url],
+                        stdout=stdout_file,
+                        timeout=35,
+                    )
+
+                page_html = tmp_html.read_text(encoding="utf-8", errors="replace")
+                tmp_html.unlink(missing_ok=True)
+
+                if proc.returncode == 0:
+                    if _looks_like_beike_detail(page_html):
+                        html = page_html
+                        raw_path = _save_raw_detail(
+                            page_html,
+                            listing.source_listing_id or f"detail{index}",
+                            output_dir,
+                        )
+                        control.log_event(
+                            "request",
+                            kind="detail",
+                            status="ok",
+                            source_listing_id=listing.source_listing_id,
+                            attempt=attempt,
+                            elapsed_seconds=round(time.monotonic() - started_at, 3),
+                            html_bytes=len(page_html),
+                            raw_path=str(raw_path),
+                        )
+                        control.record_success(
+                            kind="detail",
+                            label=listing.source_listing_id,
+                        )
+                        logger.info(
+                            "Detail %d/%d: OK %s (%d bytes) -> %s",
+                            index,
+                            len(listings),
+                            listing.source_listing_id,
+                            len(page_html),
+                            raw_path.name,
+                        )
+                        break
+                    if _is_captcha_page(page_html):
+                        captcha_seen = True
+                        control.log_event(
+                            "request",
+                            kind="detail",
+                            status="captcha",
+                            source_listing_id=listing.source_listing_id,
+                            attempt=attempt,
+                            elapsed_seconds=round(time.monotonic() - started_at, 3),
+                            html_bytes=len(page_html),
+                        )
+                        logger.warning(
+                            "Detail %s: captcha (%d bytes, attempt %d/%d), stopping",
+                            listing.source_listing_id,
+                            len(page_html),
+                            attempt,
+                            retry_attempts,
+                        )
+                        break
+                    else:
+                        control.log_event(
+                            "request",
+                            kind="detail",
+                            status="unexpected",
+                            source_listing_id=listing.source_listing_id,
+                            attempt=attempt,
+                            elapsed_seconds=round(time.monotonic() - started_at, 3),
+                            html_bytes=len(page_html),
+                        )
+                        logger.warning(
+                            "Detail %s: unexpected page (%d bytes, attempt %d/%d)",
+                            listing.source_listing_id,
+                            len(page_html),
+                            attempt,
+                            retry_attempts,
+                        )
+                        _chrome_restart()
+                elif proc.returncode == 2:
+                    control.log_event(
+                        "request",
+                        kind="detail",
+                        status="browser_disconnected",
+                        source_listing_id=listing.source_listing_id,
+                        attempt=attempt,
+                        elapsed_seconds=round(time.monotonic() - started_at, 3),
+                    )
+                    logger.warning(
+                        "Detail %s: browser disconnected (attempt %d/%d)",
+                        listing.source_listing_id,
+                        attempt,
+                        retry_attempts,
+                    )
+                    _chrome_restart()
+                else:
+                    control.log_event(
+                        "request",
+                        kind="detail",
+                        status="exit",
+                        source_listing_id=listing.source_listing_id,
+                        attempt=attempt,
+                        exit_code=proc.returncode,
+                        elapsed_seconds=round(time.monotonic() - started_at, 3),
+                    )
+                    logger.warning(
+                        "Detail %s: exit %d (attempt %d/%d)",
+                        listing.source_listing_id,
+                        proc.returncode,
+                        attempt,
+                        retry_attempts,
+                    )
+            except subprocess.TimeoutExpired:
+                tmp_html.unlink(missing_ok=True)
+                control.log_event(
+                    "request",
+                    kind="detail",
+                    status="timeout",
+                    source_listing_id=listing.source_listing_id,
+                    attempt=attempt,
+                    elapsed_seconds=round(time.monotonic() - started_at, 3),
+                )
+                logger.warning(
+                    "Detail %s: timeout (attempt %d/%d)",
+                    listing.source_listing_id,
+                    attempt,
+                    retry_attempts,
+                )
+
+        if html is None:
+            failed_urls.append(url)
+            if captcha_seen:
+                next_profile = control.record_captcha(
+                    kind="detail",
+                    label=listing.source_listing_id,
+                )
+                _open_url_for_manual_intervention(url)
+                _notify_manual_intervention(
+                    f"Detail {listing.source_listing_id}: captcha persisted, "
+                    f"next suggested profile={next_profile}"
+                )
+                break
+        else:
+            parsed = parse_beike_detail(html, url, fallback=listing)
+            if parsed is not None:
+                yield parsed
+
+        if index < len(listings):
+            control.sleep_between_requests(kind="detail", label=listing.source_listing_id)
+
+    logger.info(
+        "Beike detail batch done: %d/%d succeeded, failed=%d",
+        len(seen_urls) - len(failed_urls),
+        len(seen_urls),
+        len(failed_urls),
+    )
+
+
+def _looks_like_beike_detail(html: str) -> bool:
+    if not html or len(html) < 1000:
+        return False
+    return "content__article__info" in html and "g_conf.houseCode" in html
 
 
 # ---------------------------------------------------------------------------
