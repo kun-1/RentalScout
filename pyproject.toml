@@ -10,6 +10,7 @@ dependencies = [
   "curl-cffi>=0.15.0",
   "pandas>=2.2.0",
   "streamlit>=1.45.0",
+  "plotly>=5.0",
 ]
 
 [dependency-groups]
@@ -40,6 +41,9 @@ select = [
   "RUF",
 ]
 ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"rentalscout/web/streamlit_app.py" = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
