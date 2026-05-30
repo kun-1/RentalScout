@@ -268,25 +268,18 @@ def main() -> None:
     filters = render_sidebar(data)
     merged = merged_listing_frame(data)
     filtered = apply_listing_filters(merged, filters)
+    filtered = add_value_scores(filtered, filters["value_weights"])
 
     render_overview(data, filtered)
-    tabs = st.tabs(
-        ["🗺 地图", "📊 质量", "📍 距离", "💰 价格面积", "📌 位置价值", "🔵 经纬度聚类", "📋 房源表"]
-    )
+    tabs = st.tabs(["🗺 地图筛选", "📋 候选房源", "🧭 分析解释", "🛠 数据质量"])
     with tabs[0]:
         render_map_tab(filtered, data["distance"], filters)
     with tabs[1]:
-        render_quality_tab(data["quality"], filtered)
+        render_candidate_tab(filtered)
     with tabs[2]:
-        render_distance_tab(data["distance"], filtered)
+        render_analysis_explanation_tab(filtered)
     with tabs[3]:
-        render_price_area_tab(data["price_area"], filtered)
-    with tabs[4]:
-        render_location_value_tab(data["location_value"], filtered)
-    with tabs[5]:
-        render_geo_cluster_tab(data["geo_cluster"])
-    with tabs[6]:
-        render_listing_table(filtered)
+        render_data_quality_tab(data, filtered)
 
 
 @st.cache_data(show_spinner=False)
@@ -1730,6 +1723,170 @@ def render_location_value_tab(location_value: pd.DataFrame, filtered: pd.DataFra
         width="stretch",
         hide_index=True,
     )
+
+
+def render_candidate_tab(frame: pd.DataFrame) -> None:
+    st.subheader("候选房源")
+    if frame.empty:
+        st.info("没有符合筛选条件的房源。")
+        return
+    columns = st.columns(4)
+    columns[0].metric("候选数", len(frame))
+    columns[1].metric("高性价比", _count_value(frame, "value_level", "高性价比"))
+    columns[2].metric("Ready", _count_value(frame, "analysis_tier", "ready"))
+    columns[3].metric("附近低单价", _count_value(frame, "nearby_good_value", True))
+
+    display = _display_columns(
+        ranked_candidate_frame(frame),
+        [
+            "title",
+            "rent_price",
+            "area_sqm",
+            "rent_per_sqm",
+            "value_score",
+            "value_level",
+            "straight_distance_meters",
+            "distance_bucket",
+            "analysis_tier",
+            "nearby_good_value",
+            "good_price",
+            "good_area_price",
+            "source_url",
+        ],
+    )
+    event = st.dataframe(
+        display,
+        width="stretch",
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="candidate_table",
+    )
+    if event and event.selection and event.selection.rows:
+        idx = event.selection.rows[0]
+        selected_id = display.iloc[idx].get("listing_id") if "listing_id" in display else None
+        if not selected_id:
+            selected_id = ranked_candidate_frame(frame).iloc[idx].get("listing_id")
+        if selected_id:
+            st.session_state["map_selected_id"] = str(selected_id)
+
+
+def ranked_candidate_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    ranked = frame.copy()
+    if "value_score" not in ranked.columns:
+        ranked["value_score"] = None
+    sort_columns = [
+        column
+        for column in ["value_score", "nearby_good_value", "good_price", "straight_distance_meters"]
+        if column in ranked.columns
+    ]
+    if not sort_columns:
+        return ranked
+    ascending = [column == "straight_distance_meters" for column in sort_columns]
+    return ranked.sort_values(sort_columns, ascending=ascending, na_position="last")
+
+
+def render_analysis_explanation_tab(frame: pd.DataFrame) -> None:
+    st.subheader("分析解释")
+    if frame.empty:
+        st.info("没有符合筛选条件的房源。")
+        return
+    selected = selected_listing_row(frame)
+    if selected is None:
+        st.info("没有可解释的房源。")
+        return
+
+    title = str(selected.get("title") or "未命名房源")
+    st.markdown(f"#### {title}")
+    columns = st.columns(5)
+    columns[0].metric("租金", _money_text(selected.get("rent_price")))
+    columns[1].metric("面积", _area_text(selected.get("area_sqm")))
+    columns[2].metric("单价", _rent_per_sqm_text(selected.get("rent_per_sqm")))
+    columns[3].metric("距离", _distance_text(selected.get("straight_distance_meters")))
+    columns[4].metric("综合", str(selected.get("value_level") or "-"))
+
+    reason_columns = st.columns(2)
+    with reason_columns[0]:
+        st.markdown("##### 推荐依据")
+        for reason in listing_positive_reasons(selected):
+            st.markdown(f"- {reason}")
+    with reason_columns[1]:
+        st.markdown("##### 注意事项")
+        for risk in listing_risk_reasons(selected):
+            st.markdown(f"- {risk}")
+
+    source_url = selected.get("source_url")
+    if isinstance(source_url, str) and source_url:
+        st.link_button("打开来源页面", source_url)
+
+
+def selected_listing_row(frame: pd.DataFrame) -> pd.Series | None:
+    selected_id = st.session_state.get("map_selected_id")
+    if selected_id and "listing_id" in frame.columns:
+        matched = frame[frame["listing_id"].astype(str) == str(selected_id)]
+        if not matched.empty:
+            return matched.iloc[0]
+    ranked = ranked_candidate_frame(frame)
+    if ranked.empty:
+        return None
+    return ranked.iloc[0]
+
+
+def listing_positive_reasons(row: pd.Series) -> list[str]:
+    reasons: list[str] = []
+    if row.get("analysis_tier") == "ready":
+        reasons.append("质量层级 ready, 基础字段适合继续比较")
+    if row.get("value_level") == "高性价比":
+        reasons.append("综合评分处于当前筛选结果的高位")
+    if _to_bool(row.get("good_price")):
+        reasons.append("租金低于同距离桶的低位阈值")
+    if _to_bool(row.get("good_area_price")):
+        reasons.append("单位面积租金低于同距离桶的低位阈值")
+    if _to_bool(row.get("nearby_good_value")):
+        reasons.append("附近 1km 内单位面积租金有优势")
+    if _to_bool(row.get("below_nearby_median")):
+        reasons.append("租金低于附近房源中位数")
+    if not reasons:
+        reasons.append("当前筛选条件下可作为中性候选继续比较")
+    return reasons
+
+
+def listing_risk_reasons(row: pd.Series) -> list[str]:
+    risks: list[str] = []
+    if row.get("analysis_tier") == "blocked":
+        risks.append("质量层级 blocked, 需要谨慎查看来源页")
+    if row.get("analysis_tier") == "caution":
+        risks.append("质量层级 caution, 信息完整度或可信度有待确认")
+    if _to_bool(row.get("apartment_like")):
+        risks.append("疑似公寓类房源")
+    if _to_bool(row.get("possible_duplicate")):
+        risks.append("存在重复候选风险")
+    if (
+        row.get("nearby_sample_size") is not None
+        and pd.notna(row.get("nearby_sample_size"))
+        and float(row.get("nearby_sample_size")) < 5
+    ):
+        risks.append("附近样本量偏少")
+    notes = row.get("quality_notes")
+    if isinstance(notes, str) and notes.strip():
+        risks.append(notes.strip())
+    if not risks:
+        risks.append("暂无明显风险标记")
+    return risks
+
+
+def render_data_quality_tab(data: dict[str, pd.DataFrame], filtered: pd.DataFrame) -> None:
+    st.subheader("数据质量")
+    with st.expander("质量", expanded=True):
+        render_quality_tab(data["quality"], filtered)
+    with st.expander("距离"):
+        render_distance_tab(data["distance"], filtered)
+    with st.expander("价格面积"):
+        render_price_area_tab(data["price_area"], filtered)
+    with st.expander("位置价值"):
+        render_location_value_tab(data["location_value"], filtered)
+    with st.expander("经纬度聚类"):
+        render_geo_cluster_tab(data["geo_cluster"])
 
 
 def render_geo_cluster_tab(saved_geo_cluster: pd.DataFrame) -> None:
