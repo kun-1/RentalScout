@@ -36,6 +36,10 @@ BEIKE_PHASE1_BASE = "https://sh.zu.ke.com/zufang/pudong"
 BEIKE_PHASE1_SUFFIX = "rt200600000001l0brp3500erp6000"
 
 
+class BeikeCaptchaStop(RuntimeError):
+    """Raised when Beike captcha requires manual intervention."""
+
+
 # ---------------------------------------------------------------------------
 # URL builders
 # ---------------------------------------------------------------------------
@@ -620,7 +624,9 @@ def scrape_beike_detail_listings(
                     f"Detail {listing.source_listing_id}: captcha persisted, "
                     f"next suggested profile={next_profile}"
                 )
-                break
+                raise BeikeCaptchaStop(
+                    f"Detail {listing.source_listing_id} requires captcha handling"
+                )
         else:
             parsed = parse_beike_detail(html, url, fallback=listing)
             if parsed is not None:

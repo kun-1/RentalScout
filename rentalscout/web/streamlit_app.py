@@ -9,7 +9,6 @@ from pathlib import Path
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-import streamlit.components.v1 as components
 
 from rentalscout.analysis.commute import (
     DEFAULT_WORKPLACE_ID,
@@ -27,6 +26,7 @@ from rentalscout.analysis.geo_clusters import (
     generate_geo_cluster_outputs,
     summarize_geo_cluster_rows,
 )
+from rentalscout.analysis.location_value import PriceAreaInputRow, analyze_location_value
 from rentalscout.analysis.price_area import analyze_price_area
 from rentalscout.analysis.wellcee_quality import analyze_wellcee_quality
 from rentalscout.schemas.raw import SourceName
@@ -41,6 +41,12 @@ LOCATION_VALUE_CSV = ANALYSIS_DIR / "location_value_analysis.csv"
 GEO_CLUSTER_CSV = ANALYSIS_DIR / "geo_clusters.csv"
 PRIVATE_DIR = DATA_DIR / "private"
 DEFAULT_WORKPLACE_JSON = PRIVATE_DIR / "workplace_default.json"
+DEFAULT_WEB_WORKPLACE = Workplace(
+    workplace_id=DEFAULT_WORKPLACE_ID,
+    name="上海市浦东新区浦东图书馆",
+    longitude=121.541527,
+    latitude=31.191880,
+)
 AMAP_BASE_URL = (
     "https://wprd01.is.autonavi.com/appmaptile?"
     "x={x}&y={y}&z={z}&lang=zh_cn&size=1&scl=2&style=8"
@@ -325,8 +331,17 @@ def render_workplace_controls(data: dict[str, pd.DataFrame]) -> dict[str, pd.Dat
     if isinstance(session_analysis, dict):
         data = {**data, **session_analysis}
 
-    current = current_workplace_from_data(data["distance"]) or load_private_default_workplace()
-    if current and session_analysis is None and data["distance"].empty:
+    current = (
+        current_workplace_from_session()
+        or load_private_default_workplace()
+        or DEFAULT_WEB_WORKPLACE
+        or workplace_from_distance_frame(data["distance"])
+    )
+    if (
+        current
+        and session_analysis is None
+        and not distance_frame_uses_workplace(data["distance"], current)
+    ):
         data = {**data, **recompute_workplace_analysis(current)}
 
     with st.sidebar.expander("工作中心", expanded=True):
@@ -343,15 +358,17 @@ def render_workplace_controls(data: dict[str, pd.DataFrame]) -> dict[str, pd.Dat
                     analysis = recompute_workplace_analysis(workplace)
                     st.session_state["workplace_analysis"] = analysis
                     st.session_state["current_workplace"] = workplace_to_dict(workplace)
+                    clear_map_selection_state()
                     data = {**data, **analysis}
                     if save_as_default:
                         save_private_default_workplace(workplace)
                     st.success(f"已切换到: {workplace.name}")
 
-        active = current_workplace_from_data(data["distance"])
+        active = workplace_from_distance_frame(data["distance"]) or current_workplace_from_session()
         if active:
             st.caption(f"当前: {active.name}")
             st.caption(f"{active.longitude:.6f}, {active.latitude:.6f}")
+            st.caption(f"分析版本: {workplace_signature(active)}")
         else:
             st.caption("未设置工作中心。")
     return data
@@ -389,10 +406,34 @@ def recompute_workplace_analysis(workplace: Workplace) -> dict[str, pd.DataFrame
         quality_rows=quality_rows,
         distance_buckets=distance_buckets,
     )
+    location_rows = analyze_location_value(
+        listings=listings,
+        price_area_rows=price_area_input_rows(price_rows),
+    )
     return {
         "distance": rows_to_frame(distance_rows),
         "price_area": rows_to_frame(price_rows),
+        "location_value": rows_to_frame(location_rows),
     }
+
+
+def price_area_input_rows(rows: list[object]) -> dict[str, PriceAreaInputRow]:
+    inputs: dict[str, PriceAreaInputRow] = {}
+    for row in rows:
+        values = asdict_like(row)
+        listing_id = str(values.get("listing_id") or "")
+        if not listing_id:
+            continue
+        inputs[listing_id] = PriceAreaInputRow(
+            listing_id=listing_id,
+            rent_price=int(values["rent_price"]),
+            area_sqm=float(values["area_sqm"]),
+            rent_per_sqm=float(values["rent_per_sqm"]),
+            distance_bucket=str(values["distance_bucket"]),
+            apartment_like=bool(values["apartment_like"]),
+            possible_duplicate=bool(values["possible_duplicate"]),
+        )
+    return inputs
 
 
 def rows_to_frame(rows: list[object]) -> pd.DataFrame:
@@ -407,6 +448,17 @@ def rows_to_frame(rows: list[object]) -> pd.DataFrame:
 
 
 def current_workplace_from_data(distance: pd.DataFrame) -> Workplace | None:
+    return current_workplace_from_session() or workplace_from_distance_frame(distance)
+
+
+def current_workplace_from_session() -> Workplace | None:
+    saved = st.session_state.get("current_workplace")
+    if isinstance(saved, dict):
+        return workplace_from_dict(saved)
+    return None
+
+
+def workplace_from_distance_frame(distance: pd.DataFrame) -> Workplace | None:
     if not distance.empty:
         required = {"workplace_id", "workplace_name", "workplace_longitude", "workplace_latitude"}
         if required.issubset(distance.columns):
@@ -419,10 +471,28 @@ def current_workplace_from_data(distance: pd.DataFrame) -> Workplace | None:
                     longitude=float(row["workplace_longitude"]),
                     latitude=float(row["workplace_latitude"]),
                 )
-    saved = st.session_state.get("current_workplace")
-    if isinstance(saved, dict):
-        return workplace_from_dict(saved)
     return None
+
+
+def distance_frame_uses_workplace(distance: pd.DataFrame, workplace: Workplace) -> bool:
+    active = workplace_from_distance_frame(distance)
+    if active is None:
+        return False
+    return (
+        active.workplace_id == workplace.workplace_id
+        and active.name == workplace.name
+        and abs(active.longitude - workplace.longitude) < 0.000001
+        and abs(active.latitude - workplace.latitude) < 0.000001
+    )
+
+
+def workplace_signature(workplace: Workplace) -> str:
+    return f"{workplace.name} · {workplace.longitude:.6f},{workplace.latitude:.6f}"
+
+
+def clear_map_selection_state() -> None:
+    for key in ("map_selected_id", "map_selected_input", "map_selected_last_input"):
+        st.session_state.pop(key, None)
 
 
 def load_private_default_workplace() -> Workplace | None:
@@ -893,48 +963,7 @@ def render_map_tab(
         "虚线圆: 距工作地 4 / 8 / 12 km "
         "删除线: blocked 质量房源"
     )
-    if hidden_coordinate_count:
-        st.warning(f"{hidden_coordinate_count} 条房源无可用上海坐标, 已从地图中隐藏。")
-
-    st.markdown(
-        """
-<script>
-window.addEventListener('message', function(e) {
-    if (e.data && e.data.type === 'map_select') {
-        var input = document.querySelector('[data-testid="stTextInput"] input');
-        if (input) {
-            var setter = Object.getOwnPropertyDescriptor(
-                window.HTMLInputElement.prototype, 'value'
-            ).set;
-            setter.call(input, e.data.id || '');
-            input.dispatchEvent(new Event('input', {bubbles: true}));
-        }
-    }
-});
-</script>
-""",
-        unsafe_allow_html=True,
-    )
-
-    st.text_input(
-        "地图选中房源",
-        key="map_selected_input",
-        label_visibility="collapsed",
-    )
-    _set_map_selected_id()
-
-    components.html(
-        build_leaflet_map_html(map_frame),
-        height=740,
-        scrolling=False,
-    )
-
-
-def _set_map_selected_id() -> None:
-    value = st.session_state.get("map_selected_input", "")
-    if value:
-        st.session_state["map_selected_id"] = value
-        st.session_state["map_selected_input"] = ""
+    st.iframe(build_leaflet_map_html(map_frame), height=740)
 
 
 def ensure_map_value_columns(frame: pd.DataFrame) -> pd.DataFrame:
@@ -955,11 +984,13 @@ def build_leaflet_map_html(frame: pd.DataFrame) -> str:
 
     points = [_leaflet_point(row) for _, row in frame.iterrows()]
     payload = json.dumps(points, ensure_ascii=False, allow_nan=False)
+    signature = map_workplace_signature(points)
     return f"""
 <!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
+  <meta name="rentalscout-workplace" content="{signature}" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
@@ -1432,6 +1463,17 @@ def build_leaflet_map_html(frame: pd.DataFrame) -> str:
 </body>
 </html>
 """
+
+
+def map_workplace_signature(points: list[dict[str, object]]) -> str:
+    for point in points:
+        if point.get("marker_type") == "workplace":
+            return (
+                f"{point.get('title', '')}|"
+                f"{float(point.get('longitude') or 0):.6f},"
+                f"{float(point.get('latitude') or 0):.6f}"
+            )
+    return "no-workplace"
 
 
 def _leaflet_point(row: pd.Series) -> dict[str, object]:

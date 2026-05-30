@@ -42,7 +42,12 @@ from rentalscout.analysis.wellcee_quality import (
     DEFAULT_WELLCEE_QUALITY_SUMMARY_JSON,
     generate_wellcee_quality_outputs,
 )
-from rentalscout.batch import scrape_beike_detail_listings, scrape_beike_pages, scrape_wellcee_pages
+from rentalscout.batch import (
+    BeikeCaptchaStop,
+    scrape_beike_detail_listings,
+    scrape_beike_pages,
+    scrape_wellcee_pages,
+)
 from rentalscout.crawl_control import BeikeCrawlControl, beike_profile_names
 from rentalscout.fetch import fetch_public_page
 from rentalscout.filters import ListingFilterResult, apply_phase1_filters
@@ -707,20 +712,24 @@ def crawl_phase1(
         print(f"  Page {page_num}: {len(beike_candidates)} detail candidates")
 
         filter_results.extend(r for r in beike_pre_results if not r.accepted)
-        for detail_listing in scrape_beike_detail_listings(
-            beike_candidates,
-            retry_attempts=beike_retries,
-            delay_range=detail_control.delay_range,
-            crawl_control=detail_control,
-        ):
-            beike_detail_seen += 1
-            detail_result = apply_phase1_filters(detail_listing)
-            filter_results.append(detail_result)
-            if not detail_result.accepted:
-                continue
-            accepted.append(detail_result.listing)
-            if not dry_run:
-                upsert_listings([detail_result.listing])
+        try:
+            for detail_listing in scrape_beike_detail_listings(
+                beike_candidates,
+                retry_attempts=beike_retries,
+                delay_range=detail_control.delay_range,
+                crawl_control=detail_control,
+            ):
+                beike_detail_seen += 1
+                detail_result = apply_phase1_filters(detail_listing)
+                filter_results.append(detail_result)
+                if not detail_result.accepted:
+                    continue
+                accepted.append(detail_result.listing)
+                if not dry_run:
+                    upsert_listings([detail_result.listing])
+        except BeikeCaptchaStop as error:
+            print(f"- Beike captcha stop: {error}")
+            break
 
     beike_accepted_count = sum(
         1
