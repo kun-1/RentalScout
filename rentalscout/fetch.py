@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.request import ProxyHandler, Request, build_opener
+
+from curl_cffi import requests as curl_requests
 
 from rentalscout.schemas.raw import RawPage, SourceName
 from rentalscout.settings import RAW_DATA_DIR
@@ -17,7 +18,7 @@ DEFAULT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/125.0 Safari/537.36"
 )
-NO_PROXY_OPENER = build_opener(ProxyHandler({}))
+_SESSION = curl_requests.Session()
 
 
 @dataclass(frozen=True)
@@ -34,66 +35,60 @@ def fetch_public_page(
     *,
     output_dir: Path = RAW_DATA_DIR,
     timeout_seconds: int = 20,
+    retries: int = 3,
 ) -> FetchResult:
-    """抓取公开页面并保存原始 HTML。"""
+    """抓取公开页面并保存原始 HTML。
+
+    使用 curl_cffi + Chrome 指纹伪装, 与 spiders/beike.py 统一。网络级错误
+    (连接/DNS/超时) 会指数退避重试; HTTP 4xx/5xx 视为已完成的抓取, 保存响应体
+    并附带 error_message, 不重试。
+    """
 
     fetched_at = datetime.now(UTC)
-    request = Request(
-        url,
-        headers={
-            "User-Agent": DEFAULT_USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.5",
-        },
-    )
+    headers = {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.5",
+    }
 
-    try:
-        with NO_PROXY_OPENER.open(request, timeout=timeout_seconds) as response:
-            raw_bytes = response.read()
-            content_type = response.headers.get("content-type")
-            status_code = response.status
-    except HTTPError as error:
-        body = error.read().decode("utf-8", errors="replace")
+    last_error: Exception | None = None
+    for attempt in range(retries):
+        try:
+            response = _SESSION.request(
+                method="GET",
+                url=url,
+                headers=headers,
+                impersonate="chrome",
+                timeout=timeout_seconds,
+            )
+        except curl_requests.RequestsError as error:
+            last_error = error
+            if attempt < retries - 1:
+                time.sleep(2**attempt)
+                continue
+            break
+
+        body = response.content.decode("utf-8", errors="replace")
+        status_code = response.status_code
         raw_page = _save_body(
             source=source,
             url=url,
             body=body,
             fetched_at=fetched_at,
             output_dir=output_dir,
-            status_code=error.code,
-            content_type=error.headers.get("content-type"),
-            error_message=str(error),
+            status_code=status_code,
+            content_type=response.headers.get("content-type"),
+            error_message=None if status_code < 400 else f"HTTP {status_code}",
         )
         return FetchResult(raw_page=raw_page, body=body)
-    except URLError as error:
-        raw_page = RawPage(
-            source=source,
-            url=url,
-            fetched_at=fetched_at,
-            error_message=str(error.reason),
-        )
-        return FetchResult(raw_page=raw_page, body=None)
-    except (TimeoutError, OSError) as error:
-        raw_page = RawPage(
-            source=source,
-            url=url,
-            fetched_at=fetched_at,
-            error_message=str(error),
-        )
-        return FetchResult(raw_page=raw_page, body=None)
 
-    body = raw_bytes.decode("utf-8", errors="replace")
-    raw_page = _save_body(
+    raw_page = RawPage(
         source=source,
         url=url,
-        body=body,
         fetched_at=fetched_at,
-        output_dir=output_dir,
-        status_code=status_code,
-        content_type=content_type,
-        error_message=None,
+        error_message=str(last_error) if last_error else "fetch failed",
     )
-    return FetchResult(raw_page=raw_page, body=body)
+    return FetchResult(raw_page=raw_page, body=None)
 
 
 def _save_body(
