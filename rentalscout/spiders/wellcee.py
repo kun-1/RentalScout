@@ -246,6 +246,7 @@ class WellceeSpider(scrapy.Spider):
             latitude=latitude,
             floor=floor,
             published_at=published_at,
+            host_last_login_at=partial.get("host_last_login_at"),
             listing_type=listing_type,
             landlord_type=LandlordType.INDIVIDUAL,
             subway_info=subway_info,

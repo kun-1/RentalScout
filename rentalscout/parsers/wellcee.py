@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 import parsel
 
 from rentalscout.inspect import summarize_html
-from rentalscout.parsers.common import parse_int
+from rentalscout.parsers.common import parse_int, split_district_community
 from rentalscout.schemas.normalized import (
     LandlordType,
     ListingType,
@@ -341,6 +341,7 @@ def _parse_list_item(element: dict[str, object]) -> NormalizedRentalListing | No
         title=title,
         rent_price=rent_price,
         district=_district_from_title(title),
+        community_name=split_district_community(title)[1],
         published_at=date_posted,
         listing_type=ListingType.UNKNOWN,
         landlord_type=LandlordType.INDIVIDUAL,

@@ -35,6 +35,7 @@ class LandlordType(StrEnum):
 class ListingAvailabilityStatus(StrEnum):
     ACTIVE = "active"
     OFFLINE = "offline"
+    OUT_OF_WINDOW = "out_of_window"  # 被 API 搜索窗口挤出, 不一定是真下架
     UNKNOWN = "unknown"
 
 
@@ -62,6 +63,7 @@ class NormalizedRentalListing(BaseModel):
     available_from: str | None = None
     published_at: datetime | None = None
     updated_at: datetime | None = None
+    host_last_login_at: datetime | None = None  # 房主最后登录时间, 决定是否还能联系上
     first_seen_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     last_seen_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     listing_type: ListingType = ListingType.UNKNOWN

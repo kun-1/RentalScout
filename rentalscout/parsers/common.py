@@ -46,3 +46,19 @@ def parse_area_sqm(value: str) -> float | None:
     if not match:
         return None
     return float(match.group(1))
+
+
+def split_district_community(title: str | None) -> tuple[str | None, str | None]:
+    """从 "浦东 华泰金融大厦" 形式标题里拆出 (district, community)。
+
+    Wellcee 老抓取路径把 community 信息直接写在 title 头, 没有独立字段。
+    """
+
+    if not title:
+        return None, None
+    parts = title.split(maxsplit=1)
+    if not parts:
+        return None, None
+    if len(parts) == 1:
+        return parts[0], None
+    return parts[0], parts[1]

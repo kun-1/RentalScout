@@ -1,4 +1,4 @@
-from rentalscout.wellcee_api import api_item_to_partial
+from rentalscout.wellcee_api import _parse_login_time, api_item_to_partial
 
 
 def test_api_item_to_partial_returns_canonical_url() -> None:
@@ -22,3 +22,13 @@ def test_api_item_to_partial_returns_canonical_url() -> None:
     assert partial["title"] == "浦东 梅园三街坊"
     assert partial["latitude"] == 31.2
     assert partial["longitude"] == 121.5
+
+
+def test_parse_login_time_int_and_string_and_none() -> None:
+    from datetime import UTC, datetime
+    got_int = _parse_login_time(1782971822)
+    got_str = _parse_login_time("1782971822")
+    got_none = _parse_login_time(None)
+    assert isinstance(got_int, datetime) and got_int.tzinfo == UTC
+    assert got_int == got_str
+    assert got_none is None

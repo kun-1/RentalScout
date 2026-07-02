@@ -7,10 +7,10 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.request import ProxyHandler, Request, build_opener
 
-from rentalscout.parsers.common import parse_int
+from curl_cffi import requests as curl_requests
+
+from rentalscout.parsers.common import parse_int, split_district_community
 from rentalscout.parsers.wellcee import canonical_wellcee_url
 from rentalscout.schemas.normalized import (
     LandlordType,
@@ -108,6 +108,7 @@ def api_item_to_partial(item: dict[str, object]) -> dict[str, object] | None:
         "longitude": (
             float(item["longitude"]) if isinstance(item.get("longitude"), int | float) else None
         ),
+        "host_last_login_at": _parse_login_time(item.get("loginTime")),
     }
 
 
@@ -117,9 +118,19 @@ def _normalize_address_title(title: str, raw_district: str, district: str | None
     return title
 
 
+def _parse_login_time(value: object) -> datetime | None:
+    """把 Wellcee API 返回的 loginTime (秒级 Unix timestamp) 转成 tz-aware datetime."""
+
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=UTC)
+    if isinstance(value, str) and value.isdigit():
+        return datetime.fromtimestamp(int(value), tz=UTC)
+    return None
+
+
 # ── Legacy functions for batch.py compatibility ──────────────────────
 
-OPENER = build_opener(ProxyHandler({}))
+_SESSION = curl_requests.Session()
 
 
 @dataclass(frozen=True)
@@ -139,12 +150,17 @@ def _post_json(
     *,
     retries: int = 3,
 ) -> dict[str, object]:
-    """Legacy: kept for batch.py compatibility."""
+    """Legacy: kept for batch.py compatibility.
+
+    curl_cffi + Chrome 指纹伪装, 与 spiders 统一。HTTP 错误和网络错误都会
+    指数退避重试。
+    """
     last_error: Exception | None = None
     for attempt in range(retries):
         try:
-            request = Request(
-                url,
+            response = _SESSION.request(
+                method="POST",
+                url=url,
                 data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                 headers={
                     "Content-Type": "application/json",
@@ -156,11 +172,12 @@ def _post_json(
                         "Chrome/125.0 Safari/537.36"
                     ),
                 },
-                method="POST",
+                impersonate="chrome",
+                timeout=25,
             )
-            with OPENER.open(request, timeout=25) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except (URLError, HTTPError, TimeoutError, OSError) as exc:
+            response.raise_for_status()
+            return json.loads(response.content.decode("utf-8"))
+        except (curl_requests.RequestsError, json.JSONDecodeError) as exc:
             last_error = exc
             if attempt < retries - 1:
                 time.sleep(2**attempt)
@@ -192,9 +209,11 @@ def _listing_from_item(item: dict[str, object]) -> NormalizedRentalListing | Non
         description="; ".join(str(tag) for tag in item.get("tags", []) if tag),
         rent_price=rent_price,
         district=district,
+        community_name=split_district_community(title)[1],
         address_text=title,
         longitude=float(longitude) if isinstance(longitude, int | float) else None,
         latitude=float(latitude) if isinstance(latitude, int | float) else None,
+        host_last_login_at=_parse_login_time(item.get("loginTime")),
         listing_type=ListingType.WHOLE_RENT,
         landlord_type=LandlordType.INDIVIDUAL,
         image_urls=images,

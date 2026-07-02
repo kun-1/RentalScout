@@ -10,6 +10,7 @@ from pathlib import Path
 
 from scrapy.crawler import CrawlerProcess
 
+from rentalscout.analysis.availability import reconcile_availability
 from rentalscout.analysis.commute import (
     DEFAULT_DISTANCE_BUCKET_CSV,
     DEFAULT_DISTANCE_BUCKET_SUMMARY_JSON,
@@ -54,7 +55,11 @@ from rentalscout.filters import ListingFilterResult, apply_phase1_filters
 from rentalscout.inspect import summarize_html
 from rentalscout.parsers.beike import parse_beike_listings
 from rentalscout.parsers.wellcee import parse_wellcee_detail_title
-from rentalscout.schemas.normalized import ListingType, NormalizedRentalListing
+from rentalscout.schemas.normalized import (
+    ListingAvailabilityStatus,
+    ListingType,
+    NormalizedRentalListing,
+)
 from rentalscout.schemas.raw import SourceName
 from rentalscout.sources import DEFAULT_SOURCE_ENTRIES
 from rentalscout.spiders.beike import BeikeSpider
@@ -67,15 +72,15 @@ from rentalscout.validation.export import (
     export_validation_sample,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-    stream=sys.stderr,
-)
-
 
 def main(argv: Sequence[str] | None = None) -> int:
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%H:%M:%S",
+            stream=sys.stderr,
+        )
     parser = argparse.ArgumentParser(prog="rentalscout")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("scout-sources", help="抓取公开入口页并输出侦察摘要")
@@ -155,6 +160,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     crawl_parser.add_argument("--wellcee-retries", type=int, default=3, help="每页 API 重试次数")
     crawl_parser.add_argument("--detail-limit", type=int, default=12, help="Wellcee 详情页抓取上限")
     crawl_parser.add_argument("--dry-run", action="store_true", help="仅展示统计, 不写库和导出")
+    crawl_parser.add_argument(
+        "--reconcile-availability",
+        action="store_true",
+        help="全量抓取后标记下架房源(仅在抓满当前口径全部页时生效)",
+    )
 
     quality_parser = subparsers.add_parser(
         "analyze-wellcee-quality",
@@ -325,6 +335,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             wellcee_retries=args.wellcee_retries,
             detail_limit=args.detail_limit,
             dry_run=args.dry_run,
+            reconcile_wellcee=args.reconcile_availability,
         )
     if args.command == "analyze-wellcee-quality":
         return analyze_wellcee_quality_command(
@@ -656,6 +667,7 @@ def crawl_phase1(
     wellcee_retries: int = 3,
     detail_limit: int = 12,
     dry_run: bool = False,
+    reconcile_wellcee: bool = False,
 ) -> int:
     """执行阶段 1 批量抓取、解析、过滤、写库和验证样本导出。"""
 
@@ -784,7 +796,38 @@ def crawl_phase1(
     print(f"- validation sample: {exported}")
     print(f"- filter candidates CSV: {DEFAULT_FILTER_CSV}")
     print(f"- filter records: {exported_candidates}")
+
+    if reconcile_wellcee:
+        total = wellcee_pages_fetched[0].total if wellcee_pages_fetched else 0
+        _reconcile_wellcee_availability(wellcee_all_listings, total=total)
     return 0
+
+
+def _reconcile_wellcee_availability(
+    parsed: list[NormalizedRentalListing],
+    *,
+    total: int,
+) -> None:
+    """全量抓取后标记下架/出窗房源。"""
+
+    print("\n## 下架/出窗检测")
+    seen_ids = [listing.source_listing_id for listing in parsed if listing.source_listing_id]
+    seen_total = total if total > 0 else None
+    result = reconcile_availability(seen_ids, seen_total=seen_total)
+    coverage = "全量" if result.is_full_crawl else "非全量"
+    print(f"- 抓取: {result.saw_unique}/{result.saw_total} ({coverage})")
+    print(f"- 口径内历史房源: {result.scope_total}")
+    print(f"- 仍在架: {result.in_scope_active}")
+    if result.is_full_crawl:
+        print(f"- 本次新增下架: {result.newly_offline}")
+        print(f"- 此前已下架: {result.already_offline}")
+    else:
+        print(f"- 本次新增出窗(被搜索上限挤出): {result.newly_out_of_window}")
+        print(f"- 此前已出窗: {result.already_out_of_window}")
+    for item in result.delisted[:10]:
+        name = item.community_name or item.title[:20]
+        status = "出窗" if item.status == ListingAvailabilityStatus.OUT_OF_WINDOW else "下架"
+        print(f"  · [{status}] {name} (上次 {item.last_rent_price} 元/月)")
 
 
 def _filter_wellcee_with_details(
