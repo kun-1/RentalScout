@@ -33,29 +33,37 @@ RentalScout 聚焦上海浦东租房场景，把贝壳和 Wellcee 的房源统�
 RentalScout 当前覆盖四个核心环节：
 
 1. **采集**：从 Wellcee API/详情页和贝壳列表/详情页获取房源信息。
-2. **清洗**：统一价格、面积、户型、小区、板块、经纬度、来源链接等字段。
-3. **分析**：计算距离分桶、价格面积分位数、附近房源价值、空间聚类和数据质量标签。
+2. **清洗**：统一价格、面积、户型、小区、板块、经纬度、来源链接和**房主最后登录时间**等字段。
+3. **分析**：计算距离分桶、价格面积分位数、附近房源价值、空间聚类、数据质量标签、价格变化时序和**下架/出窗判定**。
 4. **展示**：用 Streamlit 构建本地交互式工作台，在地图和表格中筛选候选房源。
 
 ## 产品界面
 
-工作台包含：
+工作台包含 5 个标签：
 
-- 地图筛选：查看房源点位、聚类、距离分布和来源链接。
-- 候选房源：按综合性价比、距离、租金、面积和来源链接审查候选。
-- 分析解释：把质量、距离、价格面积和附近比较整合成单套房源的推荐依据与注意事项。
-- 数据质量：保留质量分层、距离分桶、价格面积、位置价值和经纬度聚类等高级分析视图。
+- **地图筛选**：房源点位 + 聚类 + 距离同心圆；每个房源卡片内集成 **房主最后登录时间**（>30天/未登录有颜色提示）和 **历史价格变化**（↑涨价 / ↓降价 / 首次记录）。
+- **候选房源**：按综合性价比、距离、租金、面积和来源链接审查候选。
+- **分析解释**：把质量、距离、价格面积和附近比较整合成单套房源的推荐依据与注意事项。
+- **数据质量**：保留质量分层、距离分桶、价格面积、位置价值和经纬度聚类等高级分析视图。
+- **价格与下架**：5 个 metric（涨价 / 降价 / 真下架 / 搜索出窗 / 房主>30天未登录）+ 5 张明细表。
+
+## 关键技术细节
+
+- **价格变化追踪**：每次 `upsert_listings` 都会向 `listing_observations` 追加一条时间序列快照（含房主最后登录时间），用 `INSERT OR IGNORE` 防止同时间戳重复。`analyze_price_history` 在此之上计算 `price_delta`、`price_delta_pct`、`first_rent_price` 等可解释字段。
+- **下架与出窗**：`reconcile_availability` 区分两种"消失"——`offline`（全量抓取下确实消失 = 真下架）和 `out_of_window`（被 Wellcee 528 条搜索上限挤出 = 不一定真下架，房源页面可能仍可访问）。CLI 默认不跑，需要时显式加 `--reconcile-availability`。
+- **房主登录时效**：API 响应里 `loginTime` 字段直接存到 `rental_listings.host_last_login_at`，Streamlit 卡片和 tab 都用它做 >30 天未登录的视觉提示。验证表明，库内约 70% 的房源房主已超过 30 天未登录。
+- **Schema 迁移**：用 SQLite `PRAGMA user_version` 维护 schema 版本（当前 v3）。每次启动自动检测旧版本并跑迁移：v2 重建曾被"漂移"加列的旧 observations 表，v3 加上 `host_last_login_at` 列。WAL 模式默认开启，Streamlit 读 + 爬虫写互不阻塞。
+- **HTTP 栈统一**：`fetch.py` 和 `wellcee_api._post_json` 都用 `curl_cffi` + Chrome 指纹，与 `spiders/beike.py` 同一策略；详情页抓取内置 3 次指数退避重试。
 
 ## 技术能力展示
 
-这个项目体现的工程能力：
-
 - Web 数据采集与反爬压力下的低频、可恢复抓取设计。
-- Pydantic 数据建模和 SQLite 本地持久化。
+- Pydantic v2 数据建模和 SQLite 本地持久化（含 schema 迁移和 WAL）。
 - 地理空间分析、Haversine 距离计算和 DBSCAN 风格聚类。
 - 数据质量分层、异常检测和可解释标签设计。
-- Streamlit + Leaflet 的本地分析工作台。
-- pytest / Ruff 驱动的基础质量保障。
+- 时间序列观测（point-in-time listing snapshots）和价格变化分析。
+- Streamlit + Leaflet 的本地分析工作台，含富 popup 卡片与图例。
+- pytest / Ruff / mypy 驱动的质量保障 + GitHub Actions CI。
 
 ## 技术栈
 
@@ -64,10 +72,10 @@ RentalScout 当前覆盖四个核心环节：
 | Language | Python 3.13 |
 | Crawling | Scrapy, curl_cffi, Chrome profile scraping |
 | Data Model | Pydantic v2 |
-| Storage | SQLite |
+| Storage | SQLite (WAL + PRAGMA user_version 迁移) |
 | Analysis | pandas, custom geospatial algorithms |
 | UI | Streamlit, Leaflet |
-| Tooling | uv, pytest, Ruff |
+| Tooling | uv, pytest, Ruff, mypy, GitHub Actions |
 
 ## 快速运行
 

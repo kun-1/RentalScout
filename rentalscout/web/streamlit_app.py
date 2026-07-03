@@ -956,13 +956,112 @@ def render_map_tab(
     )
     map_frame["quality_text"] = map_frame["analysis_tier"].fillna("")
     map_frame["apartment_like"] = map_frame["apartment_like"].fillna(False)
-    st.caption(
-        "气泡颜色: 🟢 绿边=高性价比 · ⚫ 黑边=中性 · 🟣 紫边=低性价比 "
-        "透明度: 越近越清晰, 越远越淡 "
-        "虚线圆: 距工作地 4 / 8 / 12 km "
-        "删除线: blocked 质量房源"
-    )
+
+    # 房源卡片: 房主最后登录 + 价格变化
+    map_frame = _enrich_card_columns(map_frame)
+
     st.iframe(build_leaflet_map_html(map_frame), height=740)
+
+
+def _enrich_card_columns(map_frame: pd.DataFrame) -> pd.DataFrame:
+    """为地图房源卡片补 房主最后登录 + 价格变化 两列。
+
+    - 房主最后登录: 从 rental_listings.host_last_login_at 计算 days_since_login,
+      给出文本 + 严重等级 class(>90d 红, >30d 黄, 已知近期 默认, 未知 灰)。
+    - 价格变化: 从 listing_observations 找每个 listing 最新一次价格变动
+      (price_delta != 0/None), 给文本(↑+300 / ↓-200 / "首次") + class。
+    """
+
+    enriched = map_frame.copy()
+    if "listing_id" not in enriched.columns:
+        enriched["card_login_text"] = "未知"
+        enriched["card_login_class"] = "rs-login-unknown"
+        enriched["card_price_text"] = ""
+        enriched["card_price_class"] = "rs-price-none"
+        return enriched
+
+    ids = enriched["listing_id"].astype(str).tolist()
+
+    # ---- 房主最后登录 ----
+    login_by_id: dict[str, str | None] = {}
+    try:
+        for listing in load_listings(db_path=DEFAULT_DB_PATH):
+            login_by_id[listing.source_listing_id or ""] = (
+                listing.host_last_login_at.isoformat() if listing.host_last_login_at else None
+            )
+    except Exception:
+        login_by_id = {}
+
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    local_tz = ZoneInfo("Asia/Shanghai")
+    today_local = datetime.now(local_tz).date()
+    login_text: list[str] = []
+    login_class: list[str] = []
+    for lid in ids:
+        ts = login_by_id.get(lid)
+        if not ts:
+            login_text.append("未知")
+            login_class.append("rs-login-unknown")
+            continue
+        try:
+            d_utc = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except ValueError:
+            login_text.append("未知")
+            login_class.append("rs-login-unknown")
+            continue
+        d_local = d_utc.astimezone(local_tz)
+        # 颜色阈值用"距今多少个本地日历日"判定
+        delta_days = (today_local - d_local.date()).days
+        if delta_days <= 1 or delta_days < 30:
+            css = "rs-login-fresh"
+        elif delta_days < 90:
+            css = "rs-login-warn"
+        else:
+            css = "rs-login-stale"
+        login_text.append(d_local.strftime("%Y-%m-%d"))
+        login_class.append(css)
+
+    enriched["card_login_text"] = login_text
+    enriched["card_login_class"] = login_class
+
+    # ---- 价格变化 (最新一次有效变动) ----
+    price_by_id: dict[str, dict[str, object]] = {}
+    try:
+        for row in analyze_price_history(load_observations(db_path=DEFAULT_DB_PATH)):
+            if row.source_listing_id in price_by_id:
+                continue  # price_history rows are sorted ascending; first hit = oldest, skip
+            if row.price_delta is None or row.price_delta == 0:
+                continue
+            price_by_id[row.source_listing_id] = {
+                "delta": int(row.price_delta),
+                "current": row.rent_price,
+                "previous": row.previous_rent_price,
+                "direction": "up" if row.price_delta > 0 else "down",
+            }
+    except Exception:
+        price_by_id = {}
+
+    price_text: list[str] = []
+    price_class: list[str] = []
+    for lid in ids:
+        info = price_by_id.get(lid)
+        if not info:
+            price_text.append("首次记录")
+            price_class.append("rs-price-none")
+            continue
+        sign = "+" if info["direction"] == "up" else ""
+        arrow = "↑" if info["direction"] == "up" else "↓"
+        price_text.append(
+            f"{arrow}{sign}{info['delta']}  {info['previous']}→{info['current']}"
+        )
+        price_class.append(
+            "rs-price-up" if info["direction"] == "up" else "rs-price-down"
+        )
+
+    enriched["card_price_text"] = price_text
+    enriched["card_price_class"] = price_class
+    return enriched
 
 
 def ensure_map_value_columns(frame: pd.DataFrame) -> pd.DataFrame:
@@ -1139,6 +1238,47 @@ def build_leaflet_map_html(frame: pd.DataFrame) -> str:
         text-decoration: none;
     }}
     .rs-popup-link:hover {{ background: #01696f; }}
+    .rs-card-rows {{
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        margin-top: 6px;
+        padding: 6px 8px;
+        background: #faf8f4;
+        border: 1px solid rgba(0, 0, 0, 0.06);
+        border-radius: 6px;
+    }}
+    .rs-card-row {{
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 10.5px;
+        line-height: 1.3;
+        color: #4a4a47;
+    }}
+    .rs-card-row .rs-card-ico {{
+        font-size: 11px;
+        width: 14px;
+        text-align: center;
+    }}
+    .rs-card-row .rs-card-label {{
+        color: #7a7974;
+        font-weight: 500;
+        flex-shrink: 0;
+    }}
+    .rs-card-row .rs-card-val {{
+        font-weight: 600;
+        font-variant-numeric: tabular-nums lining-nums;
+        margin-left: auto;
+        text-align: right;
+    }}
+    .rs-login-fresh   {{ color: #01696f; }}
+    .rs-login-warn    {{ color: #d19900; }}
+    .rs-login-stale   {{ color: #a12c7b; }}
+    .rs-login-unknown {{ color: #9c9a93; }}
+    .rs-price-up   {{ color: #bb653b; }}
+    .rs-price-down {{ color: #437a22; }}
+    .rs-price-none {{ color: #9c9a93; font-weight: 500 !important; }}
     #rs-legend {{
         position: absolute;
         bottom: 32px;
@@ -1246,6 +1386,17 @@ def build_leaflet_map_html(frame: pd.DataFrame) -> str:
     </div>
     <hr class="rs-legend-divider">
     <div class="rs-legend-row" style="color:#7a7974;font-size:10px;">
+      越近越清晰
+    </div>
+    <div class="rs-legend-row" style="gap:5px;color:#7a7974;font-size:10px;">
+      <span class="rs-legend-dot" style="background:#fff;border-color:#28251d;opacity:1.0;"></span>
+      <span class="rs-legend-dot" style="background:#fff;border-color:#28251d;opacity:0.72;"></span>
+      <span class="rs-legend-dot" style="background:#fff;border-color:#28251d;opacity:0.52;"></span>
+      <span class="rs-legend-dot" style="background:#fff;border-color:#28251d;opacity:0.35;"></span>
+      <span style="margin-left:2px;">&lt; 4 · 4-8 · 8-12 · &gt; 12 km</span>
+    </div>
+    <hr class="rs-legend-divider">
+    <div class="rs-legend-row" style="color:#7a7974;font-size:10px;">
       虚线圆 = 通勤距离圈
     </div>
   </div>
@@ -1330,6 +1481,26 @@ def build_leaflet_map_html(frame: pd.DataFrame) -> str:
                   target="_blank" rel="noopener noreferrer">\\u67e5\\u770b\\u539f\\u59cb\\u623f\\u6e90 \\u2192</a>`
             : "";
 
+        const loginClass = point.card_login_class || "rs-login-unknown";
+        const loginText  = escapeHtml(point.card_login_text || "\\u672a\\u77e5");
+        const priceClass = point.card_price_class || "rs-price-none";
+        const priceText  = escapeHtml(point.card_price_text || "\\u9996\\u6b21\\u8bb0\\u5f55");
+
+        const cardRows = `
+            <div class="rs-card-rows">
+                <div class="rs-card-row">
+                    <span class="rs-card-ico">👤</span>
+                    <span class="rs-card-label">房主登录</span>
+                    <span class="rs-card-val ${{loginClass}}">${{loginText}}</span>
+                </div>
+                <div class="rs-card-row">
+                    <span class="rs-card-ico">💹</span>
+                    <span class="rs-card-label">价格变化</span>
+                    <span class="rs-card-val ${{priceClass}}">${{priceText}}</span>
+                </div>
+            </div>
+        `;
+
         return `<div class="rs-tooltip">
             <div class="rs-popup-title">${{title}}</div>
             <div style="margin-bottom:4px;">${{valueBadge}}${{tierBadge}}</div>
@@ -1342,6 +1513,7 @@ def build_leaflet_map_html(frame: pd.DataFrame) -> str:
                 <span>${{escapeHtml(point.rent_per_sqm_text)}}</span>
                 <span>🏘 ${{escapeHtml(point.cluster_text)}}</span>
             </div>
+            ${{cardRows}}
             ${{link}}
         </div>`;
     }}
@@ -1494,6 +1666,10 @@ def _leaflet_point(row: pd.Series) -> dict[str, object]:
         "quality_text": str(row.get("quality_text") or ""),
         "apartment_like": bool(row.get("apartment_like")),
         "value_level_text": str(row.get("value_level_text") or "-"),
+        "card_login_text": str(row.get("card_login_text") or "未知"),
+        "card_login_class": str(row.get("card_login_class") or "rs-login-unknown"),
+        "card_price_text": str(row.get("card_price_text") or "首次记录"),
+        "card_price_class": str(row.get("card_price_class") or "rs-price-none"),
     }
 
 
