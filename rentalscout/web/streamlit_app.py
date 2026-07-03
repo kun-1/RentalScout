@@ -28,10 +28,12 @@ from rentalscout.analysis.geo_clusters import (
 )
 from rentalscout.analysis.location_value import PriceAreaInputRow, analyze_location_value
 from rentalscout.analysis.price_area import analyze_price_area
+from rentalscout.analysis.price_history import analyze_price_history
 from rentalscout.analysis.wellcee_quality import analyze_wellcee_quality
+from rentalscout.schemas.normalized import ListingAvailabilityStatus
 from rentalscout.schemas.raw import SourceName
 from rentalscout.settings import DATA_DIR
-from rentalscout.storage.sqlite import DEFAULT_DB_PATH, load_listings
+from rentalscout.storage.sqlite import DEFAULT_DB_PATH, load_listings, load_observations
 
 ANALYSIS_DIR = DATA_DIR / "analysis"
 QUALITY_CSV = ANALYSIS_DIR / "wellcee_quality.csv"
@@ -271,7 +273,9 @@ def main() -> None:
     filtered = add_value_scores(filtered, filters["value_weights"])
 
     render_overview(data, filtered)
-    tabs = st.tabs(["🗺 地图筛选", "📋 候选房源", "🧭 分析解释", "🛠 数据质量"])
+    tabs = st.tabs(
+        ["🗺 地图筛选", "📋 候选房源", "🧭 分析解释", "🛠 数据质量", "📈 价格与下架"]
+    )
     with tabs[0]:
         render_map_tab(filtered, data["distance"], filters)
     with tabs[1]:
@@ -280,6 +284,8 @@ def main() -> None:
         render_analysis_explanation_tab(filtered)
     with tabs[3]:
         render_data_quality_tab(data, filtered)
+    with tabs[4]:
+        render_price_changes_tab()
 
 
 @st.cache_data(show_spinner=False)
@@ -2125,6 +2131,238 @@ def asdict_like(row: object) -> dict[str, object]:
     if hasattr(row, "__dataclass_fields__"):
         return {field: getattr(row, field) for field in row.__dataclass_fields__}
     return dict(row)
+
+
+@st.cache_data(show_spinner="正在加载价格与下架数据...")
+def load_price_change_data(db_path_str: str) -> dict[str, pd.DataFrame]:
+    """Build per-listing frames from observations + listings for the 价格与下架 tab.
+
+    Returns frames:
+      - ``ups`` / ``downs``  : 涨价 / 降价 观测
+      - ``offline``         : latest status = offline (被 API 搜索上限挤出)
+      - ``out_of_window``   : latest status = out_of_window (真的从搜索结果消失)
+      - ``listings``        : 当前所有房源, 含 host_last_login_at + days_since_login
+    """
+    from datetime import UTC, datetime
+    db_path = Path(db_path_str)
+    rows = analyze_price_history(load_observations(db_path=db_path))
+
+    ups = [r for r in rows if r.price_delta and r.price_delta > 0]
+    downs = [r for r in rows if r.price_delta and r.price_delta < 0]
+    ups.sort(key=lambda r: -(r.price_delta_pct or 0))
+    downs.sort(key=lambda r: r.price_delta_pct or 0)
+
+    def _to_frame(items: list[object]) -> pd.DataFrame:
+        if not items:
+            return pd.DataFrame()
+        records = [
+            {k: v for k, v in asdict_like(item).items() if k != "availability_status"}
+            for item in items
+        ]
+        return pd.DataFrame.from_records(records)
+
+    # latest status per listing
+    latest: dict[tuple[str, str], object] = {}
+    for o in load_observations(db_path=db_path):
+        k = (o.source, o.source_listing_id)
+        if k not in latest or o.observed_at > latest[k].observed_at:
+            latest[k] = o
+
+    def _by_status(status: ListingAvailabilityStatus) -> pd.DataFrame:
+        items = [
+            {
+                "source": o.source,
+                "source_listing_id": o.source_listing_id,
+                "title": o.title,
+                "community_name": o.community_name,
+                "district": o.district,
+                "last_rent_price": o.rent_price,
+                "delisted_at": o.observed_at.isoformat(),
+            }
+            for o in latest.values()
+            if o.availability_status == status
+        ]
+        items.sort(key=lambda r: r["delisted_at"])
+        return pd.DataFrame.from_records(items) if items else pd.DataFrame()
+
+    # listings: per-row host_last_login + days_since_login (None = no data)
+    now = datetime.now(UTC)
+    listing_rows = []
+    for listing in load_listings(db_path=db_path):
+        login = listing.host_last_login_at
+        days = (now - login).days if login else None
+        listing_rows.append(
+            {
+                "source": listing.source.value,
+                "source_listing_id": listing.source_listing_id,
+                "title": listing.title,
+                "community_name": listing.community_name,
+                "district": listing.district,
+                "rent_price": listing.rent_price,
+                "host_last_login_at": login.isoformat() if login else None,
+                "days_since_login": days,
+            }
+        )
+    listings_df = pd.DataFrame.from_records(listing_rows)
+
+    return {
+        "ups": _to_frame(ups),
+        "downs": _to_frame(downs),
+        "out_of_window": _by_status(ListingAvailabilityStatus.OUT_OF_WINDOW),
+        "offline": _by_status(ListingAvailabilityStatus.OFFLINE),
+        "listings": listings_df,
+    }
+
+
+def render_price_changes_tab() -> None:
+    """5th tab: price up/down, delisted/out-of-window, and owner-stale listings."""
+
+    data = load_price_change_data(str(DEFAULT_DB_PATH))
+    ups = data["ups"]
+    downs = data["downs"]
+    out_of_window = data["out_of_window"]
+    offline = data["offline"]
+    listings = data["listings"]
+
+    # 5 metric cards
+    cols = st.columns(5)
+    cols[0].metric("📈 涨价", len(ups))
+    cols[1].metric("📉 降价", len(downs))
+    cols[2].metric("✕ 真下架", len(offline))
+    cols[3].metric("⊙ 搜索出窗", len(out_of_window))
+    if not listings.empty and "days_since_login" in listings.columns:
+        stale = (listings["days_since_login"].dropna() > 30).sum()
+    else:
+        stale = 0
+    cols[4].metric("⏳ 房主>30天未登录", int(stale))
+
+    st.divider()
+
+    col_up, col_down = st.columns(2)
+    with col_up:
+        st.subheader("📈 涨价房源")
+        if ups.empty:
+            st.info("暂无涨价记录。")
+        else:
+            show = ups[
+                [
+                    "community_name",
+                    "title",
+                    "previous_rent_price",
+                    "rent_price",
+                    "price_delta",
+                    "price_delta_pct",
+                    "observed_at",
+                ]
+            ].copy()
+            show["变化"] = show.apply(
+                lambda row: f"+{row['price_delta']} ({row['price_delta_pct']*100:+.1f}%)",
+                axis=1,
+            )
+            st.dataframe(
+                show.rename(
+                    columns={
+                        "community_name": "小区",
+                        "title": "标题",
+                        "previous_rent_price": "原价",
+                        "rent_price": "现价",
+                        "observed_at": "观测时间",
+                    }
+                )[["小区", "标题", "原价", "现价", "变化", "观测时间"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+    with col_down:
+        st.subheader("📉 降价房源")
+        if downs.empty:
+            st.info("暂无降价记录。")
+        else:
+            show = downs[
+                [
+                    "community_name",
+                    "title",
+                    "previous_rent_price",
+                    "rent_price",
+                    "price_delta",
+                    "price_delta_pct",
+                    "observed_at",
+                ]
+            ].copy()
+            show["变化"] = show.apply(
+                lambda row: f"{row['price_delta']} ({row['price_delta_pct']*100:+.1f}%)",
+                axis=1,
+            )
+            st.dataframe(
+                show.rename(
+                    columns={
+                        "community_name": "小区",
+                        "title": "标题",
+                        "previous_rent_price": "原价",
+                        "rent_price": "现价",
+                        "observed_at": "观测时间",
+                    }
+                )[["小区", "标题", "原价", "现价", "变化", "观测时间"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    st.divider()
+    col_oow, col_off = st.columns(2)
+    with col_oow:
+        st.subheader("⊙ 搜索出窗 (out_of_window)")
+        st.caption("历史在架, 但本次 API 搜索没出现 — 通常是 Wellcee 排序上限把老房源挤到窗外, 不一定真下架。")
+        if out_of_window.empty:
+            st.info("暂无。")
+        else:
+            st.dataframe(
+                out_of_window[["community_name", "title", "district", "last_rent_price", "delisted_at"]]
+                .rename(columns={"community_name": "小区", "title": "标题", "district": "区域",
+                                  "last_rent_price": "上次租金", "delisted_at": "判定时间"}),
+                use_container_width=True,
+                hide_index=True,
+                height=320,
+            )
+    with col_off:
+        st.subheader("✕ 真下架 (offline)")
+        st.caption("全量抓取确认, 这次确实没出现的房源。")
+        if offline.empty:
+            st.info("暂无。")
+        else:
+            st.dataframe(
+                offline[["community_name", "title", "district", "last_rent_price", "delisted_at"]]
+                .rename(columns={"community_name": "小区", "title": "标题", "district": "区域",
+                                  "last_rent_price": "上次租金", "delisted_at": "判定时间"}),
+                use_container_width=True,
+                hide_index=True,
+                height=320,
+            )
+
+    st.divider()
+    st.subheader("⏳ 房主最后登录 (>30天标深灰)")
+    if listings.empty or "days_since_login" not in listings.columns:
+        st.info("暂无数据。")
+        return
+    df = listings.copy()
+
+    def _stale_label(d: object) -> str:
+        if d is None or (isinstance(d, float) and pd.isna(d)):
+            return "未知"
+        if d > 30:
+            return "⚠ 深灰>30天"
+        return f"{int(d)}天"
+
+    df["stale"] = df["days_since_login"].apply(_stale_label)
+    df = df.sort_values(by="days_since_login", ascending=False, na_position="last")
+    st.dataframe(
+        df[["community_name", "title", "district", "rent_price", "host_last_login_at", "stale"]]
+        .rename(columns={
+            "community_name": "小区", "title": "标题", "district": "区域",
+            "rent_price": "租金", "host_last_login_at": "最后登录",
+        }),
+        use_container_width=True,
+        hide_index=True,
+        height=420,
+    )
 
 
 if __name__ == "__main__":
