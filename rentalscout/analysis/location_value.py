@@ -141,6 +141,9 @@ def analyze_location_value(
     }
     community_groups = _community_groups(listing_by_id, price_area_rows)
 
+    # M2: 一次算全表 NxN haversine 距离矩阵, 每个 target 走 numpy 行切片
+    dist_matrix_cache = _build_dist_matrix(listing_by_id)
+
     rows: list[LocationValueRow] = []
     for listing_id in sorted(listing_by_id):
         listing = listing_by_id[listing_id]
@@ -149,6 +152,7 @@ def analyze_location_value(
             listing_id,
             listing_by_id,
             radius_meters=nearby_radius_meters,
+            _dist_matrix_cache=dist_matrix_cache,
         )
         nearby_price_stats = _stats_for_ids(nearby_ids, price_area_rows, "price")
         nearby_rps_stats = _stats_for_ids(nearby_ids, price_area_rows, "rent_per_sqm")
@@ -216,25 +220,67 @@ def nearby_listing_ids(
     listing_by_id: dict[str, NormalizedRentalListing],
     *,
     radius_meters: int,
+    _dist_matrix_cache: tuple | None = None,
 ) -> list[str]:
-    """查找目标房源附近指定半径内的房源 ID。"""
+    """查找目标房源附近指定半径内的房源 ID。
+
+    M2: 用预计算的 NxN 距离矩阵做行切片, O(N) 一次, 替代原 O(N) 循环 + Python
+    haversine 调用。传 _dist_matrix_cache 以利用上游缓存; 没传时回退到旧路径。
+    """
 
     target = listing_by_id[target_id]
     if target.longitude is None or target.latitude is None:
         return []
-    nearby: list[str] = []
-    for listing_id, listing in listing_by_id.items():
-        if listing_id == target_id or listing.longitude is None or listing.latitude is None:
-            continue
-        distance = haversine_distance_meters(
-            float(target.longitude),
-            float(target.latitude),
-            float(listing.longitude),
-            float(listing.latitude),
-        )
-        if distance <= radius_meters:
-            nearby.append(listing_id)
-    return nearby
+    if _dist_matrix_cache is None:
+        # 慢路径: 原始实现, 单次调用
+        nearby: list[str] = []
+        for listing_id, listing in listing_by_id.items():
+            if listing_id == target_id or listing.longitude is None or listing.latitude is None:
+                continue
+            distance = haversine_distance_meters(
+                float(target.longitude),
+                float(target.latitude),
+                float(listing.longitude),
+                float(listing.latitude),
+            )
+            if distance <= radius_meters:
+                nearby.append(listing_id)
+        return sorted(nearby)
+
+    # 快路径: 用预计算的距离矩阵
+    dist_matrix, id_to_idx = _dist_matrix_cache
+    if target_id not in id_to_idx:
+        return []
+    i = id_to_idx[target_id]
+    row = dist_matrix[i]
+    return [lid for j, lid in enumerate(id_to_idx) if j != i and row[j] <= radius_meters]
+
+
+def _build_dist_matrix(
+    listing_by_id: dict[str, NormalizedRentalListing],
+) -> tuple:
+    """M2: 计算所有房源之间的 haversine 距离矩阵 (N x N), O(N^2) 一次。
+
+    返回 (dist_matrix: np.ndarray, id_to_idx: dict[str, int]) 供 nearby_listing_ids 行切片。
+    """
+    import numpy as np
+
+    ids = list(listing_by_id.keys())
+    n = len(ids)
+    if n == 0:
+        return np.zeros((0, 0)), {}
+    arr = np.empty((n, 2), dtype=np.float64)
+    for i, lid in enumerate(ids):
+        listing = listing_by_id[lid]
+        arr[i, 0] = np.radians(float(listing.latitude))
+        arr[i, 1] = np.radians(float(listing.longitude))
+    lat = arr[:, 0:1]
+    lon = arr[:, 1:2]
+    dlat = lat.T - lat
+    dlon = lon.T - lon
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat) * np.cos(lat.T) * np.sin(dlon / 2) ** 2
+    dist_matrix = 2 * 6371008.8 * np.arcsin(np.sqrt(a))
+    return dist_matrix, {lid: i for i, lid in enumerate(ids)}
 
 
 def summarize_location_value_rows(

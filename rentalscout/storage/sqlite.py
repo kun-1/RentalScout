@@ -58,10 +58,33 @@ class ListingObservation:
     host_last_login_at: datetime | None = None
 
 
+# 已经完成 DDL + 迁移的 db_path 集合, 避免每次读都重跑 init_db (L1)。
+_initialized_dbs: set[Path] = set()
+
+
+# 按 db_path 缓存只读连接, 让 load_listings/load_observations 等热路径
+# 不要再每次 sqlite3.connect (H2)。
+_readonly_connections: dict[Path, sqlite3.Connection] = {}
+
+
+def _get_readonly_connection(db_path: Path) -> sqlite3.Connection:
+    """复用只读连接, 没有就建。WAL 模式下读写不互斥, 单连接足够。"""
+
+    connection = _readonly_connections.get(db_path)
+    if connection is None:
+        init_db(db_path)
+        connection = sqlite3.connect(str(db_path))
+        connection.isolation_level = None  # autocommit, 避免持有锁
+        _readonly_connections[db_path] = connection
+    return connection
+
+
 def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
     """初始化本地 SQLite 数据库。"""
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    if db_path in _initialized_dbs:
+        return
     with sqlite3.connect(db_path) as connection:
         # WAL lets the Streamlit dashboard read while the crawler writes.
         connection.execute("PRAGMA journal_mode=WAL")
@@ -101,6 +124,7 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
         if current_version < CURRENT_SCHEMA_VERSION:
             _run_migrations(connection, current_version)
             connection.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
+    _initialized_dbs.add(db_path)
 
 
 def _create_observations_table(connection: sqlite3.Connection) -> None:
@@ -277,10 +301,10 @@ def load_listings(db_path: Path = DEFAULT_DB_PATH) -> list[NormalizedRentalListi
     """读取所有标准化房源。"""
 
     init_db(db_path)
-    with sqlite3.connect(db_path) as connection:
-        rows = connection.execute(
-            "SELECT payload_json FROM rental_listings ORDER BY source, source_listing_id"
-        ).fetchall()
+    connection = _get_readonly_connection(db_path)
+    rows = connection.execute(
+        "SELECT payload_json FROM rental_listings ORDER BY source, source_listing_id"
+    ).fetchall()
     return [LISTING_ADAPTER.validate_json(row[0]) for row in rows]
 
 
@@ -288,14 +312,14 @@ def load_observations(db_path: Path = DEFAULT_DB_PATH) -> list[ListingObservatio
     """Read point-in-time listing observations, falling back to current listings."""
 
     init_db(db_path)
-    with sqlite3.connect(db_path) as connection:
-        rows = connection.execute(
-            f"""
-            SELECT {", ".join(_OBSERVATION_COLUMNS)}
-            FROM listing_observations
-            ORDER BY source, source_listing_id, observed_at
-            """
-        ).fetchall()
+    connection = _get_readonly_connection(db_path)
+    rows = connection.execute(
+        f"""
+        SELECT {", ".join(_OBSERVATION_COLUMNS)}
+        FROM listing_observations
+        ORDER BY source, source_listing_id, observed_at
+        """
+    ).fetchall()
     if rows:
         return [_observation_from_row(row) for row in rows]
     return [_observation_from_listing(listing) for listing in load_listings(db_path)]

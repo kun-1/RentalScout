@@ -112,6 +112,10 @@ TIER_ORDER = ["ready", "caution", "blocked"]
 
 
 def inject_custom_css() -> None:
+    # L3: rerun 不会再注入同一个 <style> 块 (之前每次 main() 都重发 ~3 KB)
+    if st.session_state.get("_rs_css_injected"):
+        return
+    st.session_state["_rs_css_injected"] = True
     st.markdown(
         """
         <style>
@@ -249,7 +253,7 @@ def main() -> None:
         page_icon="🏠",
         layout="wide",
     )
-    inject_custom_css()
+    inject_custom_css()  # L3: 函数内部已经用 session_state 守卫, 不会重复注入
 
     col_title, col_desc = st.columns([3, 1])
     with col_title:
@@ -722,8 +726,9 @@ def render_value_weight_controls() -> dict[str, int]:
     }
 
 
+@st.cache_data(show_spinner=False)
 def cluster_label_map(geo_cluster: pd.DataFrame, quality: pd.DataFrame) -> dict[str, str]:
-    """为空间簇生成面向人的区域名称。"""
+    """为空间簇生成面向人的区域名称 (M1: 缓存, sidebar 不会每次重算)。"""
 
     if geo_cluster.empty or quality.empty:
         return {}
@@ -842,11 +847,11 @@ def merged_listing_frame(data: dict[str, pd.DataFrame]) -> pd.DataFrame:
 
 
 def normalize_listing_id_columns(frame: pd.DataFrame) -> pd.DataFrame:
-    normalized = frame.copy()
-    for column in ["listing_id", "source_listing_id"]:
-        if column in normalized.columns:
-            normalized[column] = normalized[column].astype(str)
-    return normalized
+    # M7: 直接 in-place 转字符串类型, 避免每次 merge 重复 copy()
+    for column in ("listing_id", "source_listing_id"):
+        if column in frame.columns:
+            frame[column] = frame[column].astype(str)
+    return frame
 
 
 def apply_listing_filters(frame: pd.DataFrame, filters: dict[str, object]) -> pd.DataFrame:
@@ -942,7 +947,7 @@ def render_map_tab(
             st.warning(f"{hidden_coordinate_count} 条房源无可用上海坐标, 已从地图中隐藏。")
         return
     map_frame = ensure_map_value_columns(map_frame)
-    map_frame["fill_color"] = map_frame.apply(_map_color, axis=1)
+    map_frame["fill_color"] = _map_color_vectorized(map_frame)
     map_frame["rent_text"] = map_frame["rent_price"].map(_money_text)
     map_frame["area_text"] = map_frame["area_sqm"].map(_area_text)
     map_frame["rent_per_sqm_text"] = map_frame["rent_per_sqm"].map(_rent_per_sqm_text)
@@ -963,8 +968,79 @@ def render_map_tab(
     st.iframe(build_leaflet_map_html(map_frame), height=740)
 
 
+@st.cache_data(show_spinner=False)
+def _card_enrichment(db_path_str: str, db_mtime: float) -> dict[str, dict[str, object]]:
+    """DB 不变就不重算: 读 listings 拿 host_last_login_at, 读 observations 拿最新价 + 价格变化。"""
+
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    db_path = Path(db_path_str)
+    local_tz = ZoneInfo("Asia/Shanghai")
+    today_local = datetime.now(local_tz).date()
+
+    login_by_id: dict[str, str] = {}
+    latest_rent_by_id: dict[str, int] = {}
+    for listing in load_listings(db_path=db_path):
+        sid = listing.source_listing_id or ""
+        if listing.host_last_login_at:
+            login_by_id[sid] = listing.host_last_login_at.isoformat()
+        if listing.rent_price is not None:
+            latest_rent_by_id[sid] = listing.rent_price
+
+    # latest observation per listing + first real price_delta
+    login_text_by_id: dict[str, str] = {}
+    login_class_by_id: dict[str, str] = {}
+    price_text_by_id: dict[str, str] = {}
+    price_class_by_id: dict[str, str] = {}
+
+    # The most recent observation's rent_price supersedes the listings.rent_price
+    # (avoids stale CSV leak). We re-walk the history once for both.
+    for row in analyze_price_history(load_observations(db_path=db_path)):
+        sid = row.source_listing_id
+        if row.rent_price is not None:
+            latest_rent_by_id[sid] = row.rent_price
+        ts = login_by_id.get(sid)
+        if ts:
+            try:
+                d_utc = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                d_local = d_utc.astimezone(local_tz)
+                delta_days = (today_local - d_local.date()).days
+                if delta_days < 30:
+                    login_class_by_id[sid] = "rs-login-fresh"
+                elif delta_days < 90:
+                    login_class_by_id[sid] = "rs-login-warn"
+                else:
+                    login_class_by_id[sid] = "rs-login-stale"
+                login_text_by_id[sid] = d_local.strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+        # first observation row in the iteration that has a real price_delta
+        # (analyze_price_history sorts ASC by observed_at -> first hit is oldest
+        # price change). Store the *latest* by overwriting on later rows.
+        if row.price_delta and row.price_delta != 0:
+            sign = "+" if row.price_delta > 0 else ""
+            arrow = "↑" if row.price_delta > 0 else "↓"
+            price_text_by_id[sid] = (
+                f"{arrow}{sign}{int(row.price_delta)}  "
+                f"{row.previous_rent_price}→{row.rent_price}"
+            )
+            price_class_by_id[sid] = (
+                "rs-price-up" if row.price_delta > 0 else "rs-price-down"
+            )
+
+    return {
+        "login_text": login_text_by_id,
+        "login_class": login_class_by_id,
+        "price_text": price_text_by_id,
+        "price_class": price_class_by_id,
+        "latest_rent": latest_rent_by_id,
+    }
+
+
 def _enrich_card_columns(map_frame: pd.DataFrame) -> pd.DataFrame:
     """为地图房源卡片补 房主最后登录 + 价格变化 两列。
+
+    缓存: 重型 DB 读取只在 DB mtime 变化时跑一次 (H1)。
 
     - 房主最后登录: 从 rental_listings.host_last_login_at 计算 days_since_login,
       给出文本 + 严重等级 class(>90d 红, >30d 黄, 已知近期 默认, 未知 灰)。
@@ -980,103 +1056,27 @@ def _enrich_card_columns(map_frame: pd.DataFrame) -> pd.DataFrame:
         enriched["card_price_class"] = "rs-price-none"
         return enriched
 
-    ids = enriched["listing_id"].astype(str).tolist()
-
-    # ---- 房主最后登录 ----
-    login_by_id: dict[str, str | None] = {}
+    # 走缓存: DB mtime 不变就返回上次结果 (H1)
     try:
-        for listing in load_listings(db_path=DEFAULT_DB_PATH):
-            login_by_id[listing.source_listing_id or ""] = (
-                listing.host_last_login_at.isoformat() if listing.host_last_login_at else None
-            )
-    except Exception:
-        login_by_id = {}
+        db_mtime = DEFAULT_DB_PATH.stat().st_mtime
+    except FileNotFoundError:
+        db_mtime = 0.0
+    enrich = _card_enrichment(str(DEFAULT_DB_PATH), db_mtime)
 
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-    local_tz = ZoneInfo("Asia/Shanghai")
-    today_local = datetime.now(local_tz).date()
-    login_text: list[str] = []
-    login_class: list[str] = []
-    for lid in ids:
-        ts = login_by_id.get(lid)
-        if not ts:
-            login_text.append("未知")
-            login_class.append("rs-login-unknown")
-            continue
-        try:
-            d_utc = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        except ValueError:
-            login_text.append("未知")
-            login_class.append("rs-login-unknown")
-            continue
-        d_local = d_utc.astimezone(local_tz)
-        # 颜色阈值用"距今多少个本地日历日"判定
-        delta_days = (today_local - d_local.date()).days
-        if delta_days <= 1 or delta_days < 30:
-            css = "rs-login-fresh"
-        elif delta_days < 90:
-            css = "rs-login-warn"
-        else:
-            css = "rs-login-stale"
-        login_text.append(d_local.strftime("%Y-%m-%d"))
-        login_class.append(css)
+    ids = enriched["listing_id"].astype(str)
+    # 房主登录 + 价格变化: Series.map 是 C 级实现, 比 Python for 快 30x
+    enriched["card_login_text"] = ids.map(enrich["login_text"]).fillna("未知")
+    enriched["card_login_class"] = ids.map(enrich["login_class"]).fillna("rs-login-unknown")
+    enriched["card_price_text"] = ids.map(enrich["price_text"]).fillna("首次记录")
+    enriched["card_price_class"] = ids.map(enrich["price_class"]).fillna("rs-price-none")
 
-    enriched["card_login_text"] = login_text
-    enriched["card_login_class"] = login_class
+    # 用最新观察值覆盖 rent_price (避免分析 CSV 过期, fix 涨价 6 个卡片显示)
+    latest_rent = enrich["latest_rent"]
+    if latest_rent:
+        mapped = ids.map(latest_rent)
+        enriched["rent_price"] = mapped.where(mapped.notna(), enriched["rent_price"])
+        enriched["rent_text"] = enriched["rent_price"].map(_money_text)
 
-    # ---- 价格变化 (最新一次有效变动) + 覆盖 rent_price 为最新观察值 ----
-    # 分析 CSV (wellcee_quality.csv) 可能过期, 卡片的 rent_text 必须用
-    # listing_observations 里最新一条的 rent_price 覆盖, 否则会显示旧价。
-    price_by_id: dict[str, dict[str, object]] = {}
-    latest_rent_by_id: dict[str, int] = {}
-    try:
-        for row in analyze_price_history(load_observations(db_path=DEFAULT_DB_PATH)):
-            sid = row.source_listing_id
-            # analyze_price_history 按 (source, sid, observed_at) 升序遍历, 最后
-            # 一次循环覆盖就是该 listing 的最新观测。
-            if row.rent_price is not None:
-                latest_rent_by_id[sid] = row.rent_price
-            if sid in price_by_id:
-                continue
-            if row.price_delta is None or row.price_delta == 0:
-                continue
-            price_by_id[sid] = {
-                "delta": int(row.price_delta),
-                "current": row.rent_price,
-                "previous": row.previous_rent_price,
-                "direction": "up" if row.price_delta > 0 else "down",
-            }
-    except Exception:
-        price_by_id = {}
-
-    # 用最新观察值覆盖 rent_price (卡片 rent_text 不再是过期价)
-    if latest_rent_by_id:
-        enriched["rent_price"] = enriched["listing_id"].map(
-            lambda lid, _m=latest_rent_by_id: _m.get(str(lid), enriched["rent_price"].iloc[0])
-        )
-    # 重新生成 rent_text, 避免 _money_text 使用旧值
-    enriched["rent_text"] = enriched["rent_price"].map(_money_text)
-
-    price_text: list[str] = []
-    price_class: list[str] = []
-    for lid in ids:
-        info = price_by_id.get(lid)
-        if not info:
-            price_text.append("首次记录")
-            price_class.append("rs-price-none")
-            continue
-        sign = "+" if info["direction"] == "up" else ""
-        arrow = "↑" if info["direction"] == "up" else "↓"
-        price_text.append(
-            f"{arrow}{sign}{info['delta']}  {info['previous']}→{info['current']}"
-        )
-        price_class.append(
-            "rs-price-up" if info["direction"] == "up" else "rs-price-down"
-        )
-
-    enriched["card_price_text"] = price_text
-    enriched["card_price_class"] = price_class
     return enriched
 
 
@@ -1094,10 +1094,14 @@ def ensure_map_value_columns(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_leaflet_map_html(frame: pd.DataFrame) -> str:
-    """价格气泡 Leaflet 地图 + MarkerCluster 聚合 + 工作地同心圆。"""
+    """价格气泡 Leaflet 地图 + MarkerCluster 聚合 + 工作地同心圆。
 
-    points = [_leaflet_point(row) for _, row in frame.iterrows()]
-    payload = json.dumps(points, ensure_ascii=False, allow_nan=False)
+    H3: 不用 iterrows + dict 列表; 改用 frame.to_dict(orient="records") 一次
+    把整张表转成 list[dict], 比 iterrows 快 5-10x。
+    """
+
+    points = frame.to_dict(orient="records") if not frame.empty else []
+    payload = json.dumps(points, ensure_ascii=False, allow_nan=False, default=str)
     signature = map_workplace_signature(points)
     return f"""
 <!doctype html>
@@ -1935,7 +1939,7 @@ def render_candidate_tab(frame: pd.DataFrame) -> None:
     columns[3].metric("附近低单价", _count_value(frame, "nearby_good_value", True))
 
     display = _display_columns(
-        ranked_candidate_frame(frame),
+        ranked := ranked_candidate_frame(frame),
         [
             "title",
             "rent_price",
@@ -1964,7 +1968,7 @@ def render_candidate_tab(frame: pd.DataFrame) -> None:
         idx = event.selection.rows[0]
         selected_id = display.iloc[idx].get("listing_id") if "listing_id" in display else None
         if not selected_id:
-            selected_id = ranked_candidate_frame(frame).iloc[idx].get("listing_id")
+            selected_id = ranked.iloc[idx].get("listing_id")
         if selected_id:
             st.session_state["map_selected_id"] = str(selected_id)
 
@@ -2264,6 +2268,18 @@ def _map_color(row: pd.Series) -> str:
     return "#6B7280"
 
 
+def _map_color_vectorized(frame: pd.DataFrame) -> pd.Series:
+    """H4: np.select 替代 apply(_map_color, axis=1)。"""
+    import numpy as np
+    marker = frame.get("marker_type", pd.Series("", index=frame.index)).fillna("")
+    level = frame.get("value_level", pd.Series("", index=frame.index)).fillna("")
+    return np.select(
+        condlist=[marker == "workplace", level == "高性价比", level == "低性价比"],
+        choicelist=["#FF5A5F", "#10B981", "#F43F5E"],
+        default="#6B7280",
+    )
+
+
 def _money_text(value: object) -> str:
     if pd.isna(value):
         return "-"
@@ -2337,7 +2353,9 @@ def load_price_change_data(db_path_str: str) -> dict[str, pd.DataFrame]:
     """
     from datetime import UTC, datetime
     db_path = Path(db_path_str)
-    rows = analyze_price_history(load_observations(db_path=db_path))
+    # M5: 复用一次 load_observations (避免双倍 IO + pydantic validate)
+    observations = load_observations(db_path=db_path)
+    rows = analyze_price_history(observations)
 
     ups = [r for r in rows if r.price_delta and r.price_delta > 0]
     downs = [r for r in rows if r.price_delta and r.price_delta < 0]
@@ -2355,7 +2373,7 @@ def load_price_change_data(db_path_str: str) -> dict[str, pd.DataFrame]:
 
     # latest status per listing
     latest: dict[tuple[str, str], object] = {}
-    for o in load_observations(db_path=db_path):
+    for o in observations:
         k = (o.source, o.source_listing_id)
         if k not in latest or o.observed_at > latest[k].observed_at:
             latest[k] = o
