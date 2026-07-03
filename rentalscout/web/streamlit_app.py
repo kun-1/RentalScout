@@ -1025,15 +1025,23 @@ def _enrich_card_columns(map_frame: pd.DataFrame) -> pd.DataFrame:
     enriched["card_login_text"] = login_text
     enriched["card_login_class"] = login_class
 
-    # ---- 价格变化 (最新一次有效变动) ----
+    # ---- 价格变化 (最新一次有效变动) + 覆盖 rent_price 为最新观察值 ----
+    # 分析 CSV (wellcee_quality.csv) 可能过期, 卡片的 rent_text 必须用
+    # listing_observations 里最新一条的 rent_price 覆盖, 否则会显示旧价。
     price_by_id: dict[str, dict[str, object]] = {}
+    latest_rent_by_id: dict[str, int] = {}
     try:
         for row in analyze_price_history(load_observations(db_path=DEFAULT_DB_PATH)):
-            if row.source_listing_id in price_by_id:
-                continue  # price_history rows are sorted ascending; first hit = oldest, skip
+            sid = row.source_listing_id
+            # analyze_price_history 按 (source, sid, observed_at) 升序遍历, 最后
+            # 一次循环覆盖就是该 listing 的最新观测。
+            if row.rent_price is not None:
+                latest_rent_by_id[sid] = row.rent_price
+            if sid in price_by_id:
+                continue
             if row.price_delta is None or row.price_delta == 0:
                 continue
-            price_by_id[row.source_listing_id] = {
+            price_by_id[sid] = {
                 "delta": int(row.price_delta),
                 "current": row.rent_price,
                 "previous": row.previous_rent_price,
@@ -1041,6 +1049,14 @@ def _enrich_card_columns(map_frame: pd.DataFrame) -> pd.DataFrame:
             }
     except Exception:
         price_by_id = {}
+
+    # 用最新观察值覆盖 rent_price (卡片 rent_text 不再是过期价)
+    if latest_rent_by_id:
+        enriched["rent_price"] = enriched["listing_id"].map(
+            lambda lid, _m=latest_rent_by_id: _m.get(str(lid), enriched["rent_price"].iloc[0])
+        )
+    # 重新生成 rent_text, 避免 _money_text 使用旧值
+    enriched["rent_text"] = enriched["rent_price"].map(_money_text)
 
     price_text: list[str] = []
     price_class: list[str] = []
