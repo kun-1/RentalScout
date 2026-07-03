@@ -68,12 +68,20 @@ _readonly_connections: dict[Path, sqlite3.Connection] = {}
 
 
 def _get_readonly_connection(db_path: Path) -> sqlite3.Connection:
-    """复用只读连接, 没有就建。WAL 模式下读写不互斥, 单连接足够。"""
+    """复用只读连接, 没有就建。WAL 模式下读写不互斥, 单连接足够。
+
+    check_same_thread=False: Streamlit 的 @st.cache_data 缓存未命中会用
+    其他线程跑函数, 默认 sqlite3.Connection 跨线程会抛 ProgrammingError。
+    本连接只用于读, 不会跨线程写, 安全。
+    """
 
     connection = _readonly_connections.get(db_path)
     if connection is None:
         init_db(db_path)
-        connection = sqlite3.connect(str(db_path))
+        connection = sqlite3.connect(
+            str(db_path),
+            check_same_thread=False,
+        )
         connection.isolation_level = None  # autocommit, 避免持有锁
         _readonly_connections[db_path] = connection
     return connection
