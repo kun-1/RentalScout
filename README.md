@@ -54,6 +54,7 @@ RentalScout 当前覆盖四个核心环节：
 - **房主登录时效**：API 响应里 `loginTime` 字段直接存到 `rental_listings.host_last_login_at`，Streamlit 卡片和 tab 都用它做 >30 天未登录的视觉提示。验证表明，库内约 70% 的房源房主已超过 30 天未登录。
 - **Schema 迁移**：用 SQLite `PRAGMA user_version` 维护 schema 版本（当前 v3）。每次启动自动检测旧版本并跑迁移：v2 重建曾被"漂移"加列的旧 observations 表，v3 加上 `host_last_login_at` 列。WAL 模式默认开启，Streamlit 读 + 爬虫写互不阻塞。
 - **HTTP 栈统一**：`fetch.py` 和 `wellcee_api._post_json` 都用 `curl_cffi` + Chrome 指纹，与 `spiders/beike.py` 同一策略；详情页抓取内置 3 次指数退避重试。
+- **地图组件**：地图标签页从 `st.iframe` + 手写 Leaflet HTML 迁移到 `streamlit-folium` + `folium`，用双向 component 协议避免每次 Streamlit rerun 重新解析整份 Leaflet 文档。
 
 ## 技术能力展示
 
@@ -74,7 +75,7 @@ RentalScout 当前覆盖四个核心环节：
 | Data Model | Pydantic v2 |
 | Storage | SQLite (WAL + PRAGMA user_version 迁移) |
 | Analysis | pandas, custom geospatial algorithms |
-| UI | Streamlit, Leaflet |
+| UI | Streamlit, streamlit-folium, folium |
 | Tooling | uv, pytest, Ruff, mypy, GitHub Actions |
 
 ## 快速运行
