@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from html import escape as html_escape
 from pathlib import Path
 
+import folium
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from folium.plugins import MarkerCluster
+from streamlit_folium import st_folium
 
 from rentalscout.analysis.commute import (
     DEFAULT_WORKPLACE_ID,
@@ -965,7 +969,7 @@ def render_map_tab(
     # 房源卡片: 房主最后登录 + 价格变化
     map_frame = _enrich_card_columns(map_frame)
 
-    st.iframe(build_leaflet_map_html(map_frame), height=740)
+    render_folium_map(map_frame)
 
 
 @st.cache_data(show_spinner=False)
@@ -1093,8 +1097,572 @@ def ensure_map_value_columns(frame: pd.DataFrame) -> pd.DataFrame:
     return ensured
 
 
+# Map opacity per distance bucket (matches the legacy Leaflet map)
+_DISTANCE_BUCKET_OPACITY = {
+    "within_4km": 1.0,
+    "4_to_8km": 0.72,
+    "8_to_12km": 0.52,
+    "over_12km": 0.35,
+}
+
+# Custom CSS injected once into the folium map. Re-uses the look-and-feel of
+# the previous Leaflet iframe (pulse workplace, marker cluster icons, popup
+# card layout, legend).
+_MAP_CSS = """
+<style>
+@import url('https://api.fontshare.com/v2/css?f[]=satoshi@400,500,700&display=swap');
+.leaflet-container {
+    background: #eef2f3;
+    border: 1px solid rgba(0,0,0,0.08);
+    border-radius: 10px;
+    overflow: hidden;
+    font-family: 'Satoshi', system-ui, sans-serif;
+}
+.leaflet-tile-pane {
+    filter: grayscale(25%) sepia(10%) brightness(1.05) contrast(0.93);
+}
+.rs-price-bubble {
+    background: #ffffff;
+    border: 2px solid #28251d;
+    border-radius: 999px;
+    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.18);
+    color: #28251d;
+    cursor: pointer;
+    font-family: 'Satoshi', system-ui, sans-serif;
+    font-size: 11px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums lining-nums;
+    padding: 3px 9px;
+    white-space: nowrap;
+    display: inline-block;
+}
+.rs-bubble-high { border-color: #437a22; background: #edf5e9; color: #2a5010; }
+.rs-bubble-low  { border-color: #a12c7b; background: #f9eef5; color: #7a1a5e; }
+.rs-bubble-mid  { border-color: #28251d; background: #ffffff; color: #28251d; }
+.rs-bubble-blocked { text-decoration: line-through; filter: opacity(0.55); }
+@keyframes rs-pulse-ring {
+    0%   { transform: scale(0.5); opacity: 0.75; }
+    100% { transform: scale(2.4); opacity: 0; }
+}
+.rs-workplace-pulse {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: #28251d;
+    position: relative;
+    display: block;
+    box-shadow: 0 0 0 3px rgba(40, 37, 29, 0.15);
+}
+.rs-workplace-pulse::before,
+.rs-workplace-pulse::after {
+    content: "";
+    position: absolute;
+    inset: -3px;
+    border-radius: 50%;
+    border: 2px solid #28251d;
+    animation: rs-pulse-ring 2.2s cubic-bezier(0.2, 0.8, 0.4, 1) infinite;
+    pointer-events: none;
+}
+.rs-workplace-pulse::after { animation-delay: 0.75s; }
+.rs-popup-title { font-size: 12px; font-weight: 600; line-height: 1.45; color: #28251d; margin-bottom: 6px; }
+.rs-popup-price-row { display: flex; align-items: baseline; gap: 6px; margin: 6px 0 4px; }
+.rs-popup-price-main { font-size: 20px; font-weight: 700; color: #28251d; font-variant-numeric: tabular-nums lining-nums; }
+.rs-popup-price-sub { font-size: 11px; color: #7a7974; }
+.rs-popup-meta { font-size: 11px; color: #7a7974; display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.rs-popup-badge { border-radius: 999px; padding: 2px 8px; font-size: 10px; font-weight: 600; display: inline-block; margin-bottom: 6px; }
+.rs-badge-high   { background: #edf5e9; color: #437a22; }
+.rs-badge-low    { background: #f9eef5; color: #a12c7b; }
+.rs-badge-mid    { background: #f0eeea; color: #7a7974; }
+.rs-badge-ready    { background: #eef6f6; color: #01696f; }
+.rs-badge-caution  { background: #fdf6ee; color: #d19900; }
+.rs-badge-blocked  { background: #fdf0f5; color: #a12c7b; }
+.rs-popup-link {
+    background: #28251d;
+    border-radius: 7px;
+    color: #ffffff !important;
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 500;
+    margin-top: 8px;
+    padding: 6px 10px;
+    text-decoration: none;
+}
+.rs-popup-link:hover { background: #01696f; }
+.rs-card-rows { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; padding: 6px 8px; background: #faf8f4; border: 1px solid rgba(0, 0, 0, 0.06); border-radius: 6px; }
+.rs-card-row { display: flex; align-items: center; gap: 6px; font-size: 10.5px; line-height: 1.3; color: #4a4a47; }
+.rs-card-row .rs-card-ico { font-size: 11px; width: 14px; text-align: center; }
+.rs-card-row .rs-card-label { color: #7a7974; font-weight: 500; flex-shrink: 0; }
+.rs-card-row .rs-card-val { font-weight: 600; font-variant-numeric: tabular-nums lining-nums; margin-left: auto; text-align: right; }
+.rs-login-fresh   { color: #01696f; }
+.rs-login-warn    { color: #d19900; }
+.rs-login-stale   { color: #a12c7b; }
+.rs-login-unknown { color: #9c9a93; }
+.rs-price-up   { color: #bb653b; }
+.rs-price-down { color: #437a22; }
+.rs-price-none { color: #9c9a93; font-weight: 500 !important; }
+.marker-cluster-small,
+.marker-cluster-medium,
+.marker-cluster-large { background: transparent !important; }
+.marker-cluster-small div,
+.marker-cluster-medium div,
+.marker-cluster-large div { background: transparent !important; }
+.cluster-house-icon {
+    align-items: center;
+    border-radius: 50%;
+    color: #fff;
+    display: flex;
+    flex-direction: column;
+    font-size: 10px;
+    font-weight: 700;
+    gap: 1px;
+    height: 100%;
+    justify-content: center;
+    line-height: 1;
+    width: 100%;
+}
+.cluster-house-icon svg { display: block; width: 16px; height: 16px; }
+.cluster-community { background: #01696f; box-shadow: 0 2px 8px rgba(1, 105, 111, 0.35); }
+.cluster-apartment { background: #d19900; box-shadow: 0 2px 8px rgba(209, 153, 0, 0.35); }
+#rs-legend {
+    position: absolute;
+    bottom: 32px;
+    right: 10px;
+    z-index: 1000;
+    background: rgba(255, 255, 255, 0.95);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    border-radius: 10px;
+    padding: 10px 14px;
+    font-size: 11px;
+    font-family: 'Satoshi', system-ui, sans-serif;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.10);
+    min-width: 130px;
+}
+#rs-legend-title { font-weight: 600; color: #28251d; margin-bottom: 7px; font-size: 11px; }
+.rs-legend-row { display: flex; align-items: center; gap: 7px; color: #28251d; margin-bottom: 4px; font-size: 11px; }
+.rs-legend-dot { width: 10px; height: 10px; border-radius: 50%; border: 2px solid; flex-shrink: 0; }
+.rs-legend-divider { border: none; border-top: 1px solid #dcd9d5; margin: 6px 0; }
+</style>
+"""
+
+
+_MAP_LEGEND_HTML = """
+<div id="rs-legend">
+  <div id="rs-legend-title">图例</div>
+  <div class="rs-legend-row"><span class="rs-legend-dot" style="background:#edf5e9;border-color:#437a22;"></span>高性价比</div>
+  <div class="rs-legend-row"><span class="rs-legend-dot" style="background:#fff;border-color:#28251d;"></span>中性</div>
+  <div class="rs-legend-row"><span class="rs-legend-dot" style="background:#f9eef5;border-color:#a12c7b;"></span>低性价比</div>
+  <hr class="rs-legend-divider">
+  <div class="rs-legend-row"><span style="text-decoration:line-through;opacity:0.5;font-size:10px;margin-right:2px;">价格</span>blocked</div>
+  <hr class="rs-legend-divider">
+  <div class="rs-legend-row"><span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#01696f;"></span>小区聚合</div>
+  <div class="rs-legend-row"><span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#d19900;"></span>公寓聚合</div>
+  <hr class="rs-legend-divider">
+  <div class="rs-legend-row" style="color:#7a7974;font-size:10px;">越近越清晰</div>
+  <div class="rs-legend-row" style="gap:5px;color:#7a7974;font-size:10px;">
+    <span class="rs-legend-dot" style="background:#fff;border-color:#28251d;opacity:1.0;"></span>
+    <span class="rs-legend-dot" style="background:#fff;border-color:#28251d;opacity:0.72;"></span>
+    <span class="rs-legend-dot" style="background:#fff;border-color:#28251d;opacity:0.52;"></span>
+    <span class="rs-legend-dot" style="background:#fff;border-color:#28251d;opacity:0.35;"></span>
+    <span style="margin-left:2px;">&lt; 4 · 4-8 · 8-12 · &gt; 12 km</span>
+  </div>
+  <hr class="rs-legend-divider">
+  <div class="rs-legend-row" style="color:#7a7974;font-size:10px;">虚线圆 = 通勤距离圈</div>
+</div>
+"""
+
+
+def _bubble_class(value_level_text: str, quality_text: str) -> str:
+    """Return the CSS class for a price bubble marker."""
+    if value_level_text == "高性价比":
+        level = "rs-bubble-high"
+    elif value_level_text == "低性价比":
+        level = "rs-bubble-low"
+    else:
+        level = "rs-bubble-mid"
+    if quality_text == "blocked":
+        return f"{level} rs-bubble-blocked"
+    return level
+
+
+def _folium_bubble_html(row: pd.Series) -> str:
+    """Build the price-bubble DivIcon HTML for a listing row."""
+    level_cls = _bubble_class(
+        str(row.get("value_level_text") or ""),
+        str(row.get("quality_text") or ""),
+    )
+    bucket = str(row.get("distance_bucket") or "")
+    opacity = _DISTANCE_BUCKET_OPACITY.get(bucket, 0.8)
+    rent_text = html_escape(str(row.get("rent_text") or "-"))
+    return (
+        f'<span class="rs-price-bubble {level_cls}" '
+        f'style="opacity:{opacity};">{rent_text}</span>'
+    )
+
+
+def _folium_popup_html(row: pd.Series) -> str:
+    """Re-implement the legacy popupHtml() in Python (XSS-safe)."""
+    marker_type = str(row.get("marker_type") or "listing")
+    if marker_type == "workplace":
+        title = html_escape(str(row.get("title") or ""))
+        return (
+            '<div style="font-family:\'Satoshi\',system-ui,sans-serif;">'
+            '<div class="rs-popup-title">📍 工作地</div>'
+            f'<div style="font-size:12px;color:#7a7974;">{title}</div>'
+            '</div>'
+        )
+
+    title = html_escape(str(row.get("title") or "未命名房源"))
+    value_level = str(row.get("value_level_text") or "")
+    value_badge_class = (
+        "rs-badge-high" if value_level == "高性价比"
+        else "rs-badge-low" if value_level == "低性价比"
+        else "rs-badge-mid"
+    )
+    value_badge = (
+        f'<span class="rs-popup-badge {value_badge_class}">{html_escape(value_level)}</span> '
+        if value_level else ""
+    )
+
+    quality = str(row.get("quality_text") or "")
+    tier_badge_class = (
+        "rs-badge-ready" if quality == "ready"
+        else "rs-badge-caution" if quality == "caution"
+        else "rs-badge-blocked" if quality == "blocked"
+        else "rs-badge-mid"
+    )
+    tier_label = {"ready": "可用", "caution": "警告", "blocked": "已拒"}.get(quality, "")
+    tier_badge = (
+        f'<span class="rs-popup-badge {tier_badge_class}">{tier_label}</span>'
+        if tier_badge_class != "rs-badge-mid" else ""
+    )
+
+    source_url = str(row.get("source_url") or "")
+    link = (
+        f'<a class="rs-popup-link" href="{html_escape(source_url)}" '
+        'target="_blank" rel="noopener noreferrer">查看原始房源 →</a>'
+        if source_url else ""
+    )
+
+    login_class = html_escape(str(row.get("card_login_class") or "rs-login-unknown"))
+    login_text = html_escape(str(row.get("card_login_text") or "未知"))
+    price_class = html_escape(str(row.get("card_price_class") or "rs-price-none"))
+    price_text = html_escape(str(row.get("card_price_text") or "首次记录"))
+    rent_text = html_escape(str(row.get("rent_text") or "-"))
+    area_text = html_escape(str(row.get("area_text") or "-"))
+    distance_text = html_escape(str(row.get("distance_text") or "-"))
+    rent_per_sqm_text = html_escape(str(row.get("rent_per_sqm_text") or "-"))
+    cluster_text = html_escape(str(row.get("cluster_text") or ""))
+
+    card_rows = (
+        '<div class="rs-card-rows">'
+        '<div class="rs-card-row">'
+        '<span class="rs-card-ico">👤</span>'
+        '<span class="rs-card-label">房主登录</span>'
+        f'<span class="rs-card-val {login_class}">{login_text}</span>'
+        '</div>'
+        '<div class="rs-card-row">'
+        '<span class="rs-card-ico">💹</span>'
+        '<span class="rs-card-label">价格变化</span>'
+        f'<span class="rs-card-val {price_class}">{price_text}</span>'
+        '</div>'
+        '</div>'
+    )
+
+    return (
+        '<div style="font-family:\'Satoshi\',system-ui,sans-serif;">'
+        f'<div class="rs-popup-title">{title}</div>'
+        f'<div style="margin-bottom:4px;">{value_badge}{tier_badge}</div>'
+        '<div class="rs-popup-price-row">'
+        f'<span class="rs-popup-price-main">{rent_text}</span>'
+        f'<span class="rs-popup-price-sub">{area_text}</span>'
+        '</div>'
+        '<div class="rs-popup-meta">'
+        f'<span>📍 {distance_text}</span>'
+        f'<span>{rent_per_sqm_text}</span>'
+        f'<span>🏘 {cluster_text}</span>'
+        '</div>'
+        f'{card_rows}{link}'
+        '</div>'
+    )
+
+
+def _folium_workplace_popup_html(row: pd.Series) -> str:
+    """Popup HTML for the workplace marker."""
+    title = html_escape(str(row.get("title") or ""))
+    return (
+        '<div style="font-family:\'Satoshi\',system-ui,sans-serif;">'
+        '<div class="rs-popup-title">📍 工作地</div>'
+        f'<div style="font-size:12px;color:#7a7974;">{title}</div>'
+        '</div>'
+    )
+
+
+def _cluster_icon_create_js(cluster_type: str) -> str:
+    """Return a JS function string for the ``iconCreateFunction`` option.
+
+    Mirrors the legacy Leaflet map's cluster icon: a coloured circle with an
+    inline SVG (house for community, building for apartment) and a count
+    label. The function is embedded as a string in the options dict that
+    folium passes to ``L.markerClusterGroup({...})``.
+    """
+
+    if cluster_type == "community":
+        svg = (
+            "<svg viewBox='0 0 24 24' fill='currentColor'>"
+            "<path d='M12 3L2 12h3v8h5v-6h4v6h5v-8h3L12 3z'/></svg>"
+        )
+        css_class = "cluster-community"
+    else:
+        svg = (
+            "<svg viewBox='0 0 24 24' fill='currentColor'>"
+            "<rect x='4' y='10' width='16' height='12' rx='1'/>"
+            "<rect x='7' y='2' width='10' height='8' rx='1.5'/></svg>"
+        )
+        css_class = "cluster-apartment"
+    return (
+        "function(cluster) {"
+        f"  return L.divIcon({{"
+        f"    className: '',"
+        f"    html: \"<div class='cluster-house-icon {css_class}'>"
+        f"{svg}<span>\" + cluster.getChildCount() + \"</span></div>\","
+        f"    iconSize: [44, 44],"
+        f"    iconAnchor: [22, 22]"
+        f"  }});"
+        f"}}"
+    )
+
+
+def _build_folium_map(frame: pd.DataFrame) -> folium.Map:
+    """Build a folium.Map for the rental listings tab.
+
+    Mirrors the previous Leaflet iframe:
+    - AMAP base + label tile layers
+    - Workplace pulse marker with 3 dashed distance circles (4/8/12 km)
+    - Two MarkerCluster groups (community vs apartment) with DivIcon bubbles
+    - Click handler on each marker that opens the source_url in a new tab
+    """
+    workplace_rows = frame[frame["marker_type"] == "workplace"]
+    listing_rows = frame[frame["marker_type"] != "workplace"]
+
+    center_lat = DEFAULT_WEB_WORKPLACE.latitude
+    center_lng = DEFAULT_WEB_WORKPLACE.longitude
+    if not workplace_rows.empty:
+        first = workplace_rows.iloc[0]
+        if pd.notna(first.get("latitude")) and pd.notna(first.get("longitude")):
+            center_lat = float(first["latitude"])
+            center_lng = float(first["longitude"])
+
+    fmap = folium.Map(
+        location=[center_lat, center_lng],
+        zoom_start=12,
+        tiles=None,
+        control_scale=False,
+    )
+    folium.TileLayer(
+        tiles=AMAP_BASE_URL,
+        attr="© 高德地图",
+        max_zoom=19,
+        min_zoom=3,
+        opacity=1.0,
+        name="amap-base",
+    ).add_to(fmap)
+    folium.TileLayer(
+        tiles=AMAP_LABEL_URL,
+        attr="© 高德地图 标注",
+        max_zoom=19,
+        min_zoom=3,
+        opacity=0.82,
+        show=False,
+        name="amap-label",
+    ).add_to(fmap)
+
+    # Inject CSS once (defensive: folium's get_root will dedupe by html but
+    # multiple <style> blocks are harmless when scopes don't collide).
+    fmap.get_root().html.add_child(folium.Element(_MAP_CSS))
+
+    # Workplace: dashed distance circles + pulse marker
+    if not workplace_rows.empty:
+        wp = workplace_rows.iloc[0]
+        wp_lat, wp_lng = float(wp["latitude"]), float(wp["longitude"])
+        for radius, color in (
+            (4000, "#01696f"),
+            (8000, "#d19900"),
+            (12000, "#bb653b"),
+        ):
+            folium.Circle(
+                location=[wp_lat, wp_lng],
+                radius=radius,
+                color=color,
+                weight=1.5,
+                opacity=0.55,
+                fill_color=color,
+                fill_opacity=0.04 if radius == 4000 else 0.03 if radius == 8000 else 0.02,
+                dash_array="5 5",
+                interactive=False,
+            ).add_to(fmap)
+        workplace_icon = folium.DivIcon(
+            icon_size=(36, 36),
+            icon_anchor=(18, 18),
+            html='<span class="rs-workplace-pulse"></span>',
+        )
+        folium.Marker(
+            location=[wp_lat, wp_lng],
+            icon=workplace_icon,
+            popup=folium.Popup(
+                _folium_workplace_popup_html(wp),
+                max_width=280,
+            ),
+            tooltip="工作地",
+        ).add_to(fmap)
+
+    # Listing markers, split by community / apartment, into two clusters.
+    # The iconCreateFunction JS string preserves the legacy house / apartment
+    # cluster icon (coloured circle + inline SVG + count).
+    community_cluster = MarkerCluster(
+        name="community",
+        options={
+            "chunkedLoading": True,
+            "disableClusteringAtZoom": 15,
+            "maxClusterRadius": 46,
+            "showCoverageOnHover": False,
+            "spiderfyOnMaxZoom": True,
+            "zoomToBoundsOnClick": True,
+            "iconCreateFunction": _cluster_icon_create_js("community"),
+        },
+    )
+    apartment_cluster = MarkerCluster(
+        name="apartment",
+        options={
+            "chunkedLoading": True,
+            "disableClusteringAtZoom": 15,
+            "maxClusterRadius": 46,
+            "showCoverageOnHover": False,
+            "spiderfyOnMaxZoom": True,
+            "zoomToBoundsOnClick": True,
+            "iconCreateFunction": _cluster_icon_create_js("apartment"),
+        },
+    )
+    community_cluster.add_to(fmap)
+    apartment_cluster.add_to(fmap)
+
+    for _, row in listing_rows.iterrows():
+        lat = row.get("latitude")
+        lng = row.get("longitude")
+        if not (pd.notna(lat) and pd.notna(lng)):
+            continue
+        rent_text = str(row.get("rent_text") or "-")
+        bubble_width = max(60, len(rent_text) * 7 + 24)
+        icon = folium.DivIcon(
+            icon_size=(bubble_width, 24),
+            icon_anchor=(bubble_width / 2, 12),
+            html=_folium_bubble_html(row),
+        )
+        marker = folium.Marker(
+            location=[float(lat), float(lng)],
+            icon=icon,
+            tooltip=folium.Tooltip(
+                _folium_popup_html(row),
+                direction="top",
+                offset=(0, -16),
+                sticky=False,
+            ),
+        )
+        if row.get("apartment_like"):
+            marker.add_to(apartment_cluster)
+        else:
+            marker.add_to(community_cluster)
+
+    return fmap
+
+
+def render_folium_map(frame: pd.DataFrame) -> None:
+    """Build and render the folium map for the 地图筛选 tab.
+
+    Uses streamlit-folium's bidirectional component so the map only re-renders
+    markers on data change, instead of re-parsing the entire Leaflet HTML on
+    every Streamlit rerun (as the legacy ``st.iframe(build_leaflet_map_html(...))``
+    path did).
+    """
+    fmap = _build_folium_map(frame)
+
+    # Append the legend overlay inside the map container so it scrolls with
+    # the map; this preserves the visual element the legacy iframe provided.
+    fmap.get_root().html.add_child(folium.Element(_MAP_LEGEND_HTML))
+
+    # Make the inner map height fill the st_folium container (default 500 is
+    # too short vs the iframe 720).
+    fmap.get_root().html.add_child(
+        folium.Element(
+            '<style>.folium-map { height: 740px !important; }</style>'
+        )
+    )
+
+    map_state = st_folium(
+        fmap,
+        height=740,
+        use_container_width=True,
+        returned_objects=("last_clicked",),
+        key="rentalscout_folium_map",
+    )
+
+    # Click-to-open: when the user clicks a marker, st_folium returns its
+    # lat/lng in ``last_clicked``. Look up the matching listing and surface
+    # the source link below the map so the user can open it.
+    if map_state and isinstance(map_state, dict):
+        clicked = map_state.get("last_clicked")
+        if isinstance(clicked, dict):
+            clat = clicked.get("lat")
+            clng = clicked.get("lng")
+            if clat is not None and clng is not None:
+                match = _find_listing_at(frame, float(clat), float(clng))
+                if match is not None:
+                    url = str(match.get("source_url") or "")
+                    title = str(match.get("title") or "未命名房源")
+                    if url:
+                        st.link_button(f"打开来源: {title}", url)
+                    else:
+                        st.caption(f"已选中: {title} (无来源链接)")
+
+
+def _find_listing_at(
+    frame: pd.DataFrame,
+    lat: float,
+    lng: float,
+    *,
+    tolerance: float = 1e-4,
+) -> pd.Series | None:
+    """Return the listing row whose (latitude, longitude) matches the click.
+
+    ``tolerance`` is in degrees (~11m at 31N). Markers store their own coords
+    so we only need to compare.
+    """
+    listings = frame[frame["marker_type"] != "workplace"]
+    if listings.empty:
+        return None
+    matched = listings[
+        (listings["latitude"].astype(float).sub(lat).abs() < tolerance)
+        & (listings["longitude"].astype(float).sub(lng).abs() < tolerance)
+    ]
+    if matched.empty:
+        # Fallback: closest by squared distance.
+        diffs = (
+            (listings["latitude"].astype(float) - lat) ** 2
+            + (listings["longitude"].astype(float) - lng) ** 2
+        )
+        idx = diffs.idxmin()
+        return listings.loc[idx] if idx in listings.index else None
+    return matched.iloc[0]
+
+
 def build_leaflet_map_html(frame: pd.DataFrame) -> str:
-    """价格气泡 Leaflet 地图 + MarkerCluster 聚合 + 工作地同心圆。
+    """[LEGACY] 价格气泡 Leaflet 地图 + MarkerCluster 聚合 + 工作地同心圆。
+
+    已被 :func:`render_folium_map` 替代。保留作为回退方案: 把 ``render_map_tab``
+    里的 ``render_folium_map(map_frame)`` 改回 ``st.iframe(build_leaflet_map_html(map_frame), height=740)``
+    即可恢复。仅在 ``_build_folium_map`` 出问题 (例如 streamlit-folium 在新版本
+    Streamlit 上崩溃) 时作为热修用; 长期请迁移到 folium。
 
     H3: 不用 iterrows + dict 列表; 改用 frame.to_dict(orient="records") 一次
     把整张表转成 list[dict], 比 iterrows 快 5-10x。
@@ -1657,6 +2225,7 @@ def build_leaflet_map_html(frame: pd.DataFrame) -> str:
 
 
 def map_workplace_signature(points: list[dict[str, object]]) -> str:
+    """[LEGACY] 仅由 :func:`build_leaflet_map_html` 内部使用。"""
     for point in points:
         if point.get("marker_type") == "workplace":
             return (
@@ -1668,6 +2237,7 @@ def map_workplace_signature(points: list[dict[str, object]]) -> str:
 
 
 def _leaflet_point(row: pd.Series) -> dict[str, object]:
+    """[LEGACY] 把单行 dataframe 序列化成 Leaflet iframe 用的 JSON 字典。"""
     return {
         "latitude": _json_float(row.get("latitude")),
         "longitude": _json_float(row.get("longitude")),
