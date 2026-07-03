@@ -2487,7 +2487,7 @@ def render_price_changes_tab() -> None:
                         "observed_at": "观测时间",
                     }
                 )[["小区", "标题", "原价", "现价", "变化", "观测时间"]],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
     with col_down:
@@ -2520,7 +2520,7 @@ def render_price_changes_tab() -> None:
                         "observed_at": "观测时间",
                     }
                 )[["小区", "标题", "原价", "现价", "变化", "观测时间"]],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -2536,7 +2536,7 @@ def render_price_changes_tab() -> None:
                 out_of_window[["community_name", "title", "district", "last_rent_price", "delisted_at"]]
                 .rename(columns={"community_name": "小区", "title": "标题", "district": "区域",
                                   "last_rent_price": "上次租金", "delisted_at": "判定时间"}),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 height=320,
             )
@@ -2550,7 +2550,7 @@ def render_price_changes_tab() -> None:
                 offline[["community_name", "title", "district", "last_rent_price", "delisted_at"]]
                 .rename(columns={"community_name": "小区", "title": "标题", "district": "区域",
                                   "last_rent_price": "上次租金", "delisted_at": "判定时间"}),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 height=320,
             )
@@ -2577,7 +2577,7 @@ def render_price_changes_tab() -> None:
             "community_name": "小区", "title": "标题", "district": "区域",
             "rent_price": "租金", "host_last_login_at": "最后登录",
         }),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         height=420,
     )
